@@ -9,7 +9,7 @@ from catalog import (
     decode_catalog, fetch_profile,
     region_rank, request_data, url,
 )
-from verge import Bench, DATA, Ownership, find_verge
+from verge import Bench, DATA, Ownership, ensure_verge, find_verge
 
 DEFAULTS = dict(PUBLIC_SETTINGS, direct_hosts="", **CatalogSource().settings())
 
@@ -37,10 +37,11 @@ class Candidate:
 
 
 class Engine:
-    def __init__(self, log, progress=None):
+    def __init__(self, log, progress=None, *, data_dir=None):
         self.log = log
         self.progress = progress or (lambda *_: None)
-        self.own = Ownership(log)
+        self.data_dir = data_dir if data_dir is not None else DATA
+        self.own = Ownership(log, data_dir=data_dir)
         self.catalog = None
         self.imported_settings = {}
         self.profiles = []
@@ -56,12 +57,22 @@ class Engine:
         if self.cancel.is_set():
             raise VPNError("操作已取消")
 
+    def retry(self, operation, label):
+        for attempt in range(3):
+            self.cancelled()
+            try:
+                return operation(attempt)
+            except VPNError:
+                if attempt == 2:
+                    raise
+                self.log(f"{label}失败，正在第 {attempt + 1}/2 次重试")
+
     def sync(self, settings, path=None, *, stale=False):
         self.imported_settings = {}
         source = CatalogSource(settings["catalog"], settings["password"])
         if not source.configured:
             raise VPNError("请在「高级模式」中设置 VXP 链接和密钥")
-        cache = DATA / f"subscriptions-{source.identity()}.vxp"
+        cache = self.data_dir / f"subscriptions-{source.identity()}.vxp"
         try:
             if path:
                 self.progress("读取目录文件", 0, 0)
@@ -73,14 +84,17 @@ class Engine:
                 self.progress("下载加密目录", 0, 0)
                 self.log("下载加密订阅目录")
                 try:
-                    payload, _, _ = request_data(source.url,
-                                                 limit=1024 * 1024, revalidate=True)
+                    payload, _, _ = self.retry(lambda attempt: request_data(
+                        source.url, limit=1024 * 1024, revalidate=True,
+                        **({"proxy": self.own.probe} if attempt and self.current and self.own.probe else {})),
+                        "下载加密目录")
                 except VPNError as e:
                     raise CatalogDownloadError(str(e)) from None
             self.progress("校验并解密目录", 0, 0)
             self.log("校验完整性并解密订阅目录")
             result, imported = decode_catalog(payload, source.key)
         except (OSError, VPNError) as e:
+            self.cancelled()
             reason = str(e) if isinstance(e, VPNError) else "无法读取目录文件"
             if not stale or not cache.exists():
                 if isinstance(e, CatalogDownloadError):
@@ -103,24 +117,25 @@ class Engine:
         profiles = {}
         proxy = self.own.probe if self.current and self.own.probe else None
 
-        def fetch(address, **kwargs):
-            try:
-                return request_data(address, **kwargs)
-            except VPNError:
-                # A system proxy is not inherited by the downloader. If direct
-                # access failed, retry the active VPN-X outbound when available.
-                if not proxy:
-                    raise
-                return request_data(address, proxy=proxy, **kwargs)
-
         def update(vendor):
             self.cancelled()
             self.log(f"{vendor.name}：更新订阅")
-            issues = []
-            def report(message):
-                issues.append(vendor.name)
-                self.log(message)
-            return fetch_profile(vendor, report, fetch), issues
+            def attempt_profile(attempt):
+                issues = []
+                first = True
+                def report(message):
+                    issues.append(vendor.name)
+                    self.log(message)
+                def fetch(address, **kwargs):
+                    nonlocal first
+                    def request(index):
+                        return request_data(address, **kwargs, **({"proxy": proxy} if index and proxy else {}))
+                    if first:
+                        first = False
+                        return request(attempt)
+                    return self.retry(request, f"{vendor.name}节点源请求")
+                return fetch_profile(vendor, report, fetch), issues
+            return self.retry(attempt_profile, f"{vendor.name}订阅更新")
 
         with ThreadPoolExecutor(max_workers=6) as pool:
             jobs = {pool.submit(update, v): v for v in self.catalog}
@@ -230,8 +245,11 @@ class Engine:
         self.results.sort(key=lambda c: c.sort_key(preferred_regions(settings)))
         self.log(f"已排序 {len(self.results)} 个节点：地区优先级 → 厂商优先级 → 订阅剩余流量 → 连接延迟")
 
-    def auto(self, settings):
-        self.refresh(settings, stale=True)
+    def auto(self, settings, path=None):
+        self.progress("检查内置 Clash 内核", 0, 0)
+        exe = ensure_verge(self.log)
+        self.own.prepare(exe)
+        self.refresh(settings, path, stale=path is None)
         settings = dict(settings, **self.imported_settings)
         self.measure(settings)
         self.activate(settings)

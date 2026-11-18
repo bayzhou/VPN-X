@@ -11,3 +11,6 @@ installers/*.exe
 /Clash Verge/
 /clash/
 /bench-*/
+/updates/
+*.pem
+update-public-key.bin

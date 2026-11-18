@@ -459,9 +459,9 @@ def active_config(profiles, doc, settings, mixed, probe, token, *, geo, direct):
 
 
 class Ownership:
-    def __init__(self, log):
+    def __init__(self, log, *, data_dir=None):
         self.log = log
-        self.journal = DATA / "restore.json.dpapi"
+        self.journal = (data_dir if data_dir is not None else DATA) / "restore.json.dpapi"
         self.core = None
         self.probe = None
         self.group_keys = {}

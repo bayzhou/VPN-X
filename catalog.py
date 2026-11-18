@@ -109,8 +109,11 @@ def url(value, *, https=False):
 class CatalogSource:
     url: str = ""
     key: str = ""
+    update_url: str = ""
 
     def __post_init__(self):
+        if self.update_url != "":
+            url(self.update_url, https=True)
         if self.url == self.key == "":
             return
         url(self.url, https=True)
@@ -135,10 +138,10 @@ class CatalogSource:
             value = json.loads(data.decode("utf-8-sig"))
         except (ValueError, UnicodeError, RecursionError):
             raise VPNError("目录来源文件须为 UTF-8 JSON") from None
-        if (not isinstance(value, dict) or set(value) != {"url", "key"}
+        if (not isinstance(value, dict) or not {"url", "key"} <= set(value) <= {"url", "key", "update_url"}
                 or not isinstance(value.get("url"), str)):
-            raise VPNError("目录来源文件须包含 url 和 key")
-        return cls(value["url"], value["key"])
+            raise VPNError("目录来源文件须包含 url 和 key，可选 update_url")
+        return cls(value["url"], value["key"], value.get("update_url", ""))
 
     def save(self, path):
         atomic(path, (json.dumps(asdict(self), ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
@@ -148,6 +151,26 @@ class CatalogSource:
 
     def identity(self):
         return hashlib.sha256(self.url.encode() + b"\x00" + self.key.encode()).hexdigest()[:24]
+
+
+def load_catalog_source(path, defaults_path=None):
+    """Keep user overrides while filling gaps from installer defaults."""
+    try:
+        saved = CatalogSource.load(path)
+    except FileNotFoundError:
+        saved = None
+    source = saved if saved is not None else CatalogSource()
+    if defaults_path is not None and (not source.configured or not source.update_url):
+        try:
+            defaults = CatalogSource.load(defaults_path)
+        except FileNotFoundError:
+            defaults = CatalogSource()
+        # A subscription URL and its key must come from the same source.
+        subscription = source if source.configured else defaults
+        source = CatalogSource(subscription.url, subscription.key, source.update_url or defaults.update_url)
+    if source != saved:
+        source.save(path)
+    return source
 
 
 def request_data(address, *, limit=MAX_DOWNLOAD, seconds=18, proxy=None, revalidate=False):

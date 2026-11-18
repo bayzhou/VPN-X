@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import ctypes
 from datetime import datetime
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -14,21 +16,23 @@ import traceback
 
 from PySide6.QtCore import QObject, QLockFile, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QFont, QIcon
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
     QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem,
-    QStackedWidget, QVBoxLayout, QWidget,
+    QStackedWidget, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
-from app_info import APP_NAME, APP_VERSION, RELEASE_NAME
+from app_info import APP_NAME, APP_VERSION
 from automation import DEFAULTS, Engine
 from catalog import (
     CLOUDFLARE_CHECK, DEFAULT_CHECK, PUBLIC_SETTINGS, SOURCE_FILENAME,
     CatalogDownloadError, CatalogSource, VPNError, atomic, catalog_settings, check_page_password,
-    direct_hosts, encrypt, page_password_hash,
+    direct_hosts, encrypt, load_catalog_source, page_password_hash,
 )
-from verge import Bench, DATA, LEGACY_DATA, ensure_verge, find_verge
+from verge import Bench, DATA, LEGACY_DATA, find_verge
+import updates
 
 STYLE = """
 QMainWindow, QWidget#mainSurface, QDialog { background:#ffffff; }
@@ -157,12 +161,16 @@ class CatalogEditor(QWidget):
         self.source_key = QLineEdit()
         self.source_key.setMaxLength(1024)
         self.source_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.update_url = QLineEdit()
+        self.update_url.setMaxLength(8192)
+        self.update_url.setPlaceholderText("HTTPS 更新清单地址")
         self.key_visibility = button("显示", self.toggle_key)
         key_row = QHBoxLayout()
         key_row.addWidget(self.source_key, 1)
         key_row.addWidget(self.key_visibility)
         form.addRow("VXP 链接", self.source_url)
         form.addRow("VXP 密钥", key_row)
+        form.addRow("软件更新链接", self.update_url)
         source_layout.addLayout(form)
         actions = QHBoxLayout()
         actions.addWidget(button("保存来源", self.save_source))
@@ -170,7 +178,7 @@ class CatalogEditor(QWidget):
         actions.addWidget(button("导出来源", self.export_source))
         actions.addStretch()
         source_layout.addLayout(actions)
-        source_layout.addWidget(banner(f"将 {SOURCE_FILENAME} 与 {RELEASE_NAME}.exe 放在同一目录即可自动读取。", "muted"))
+        source_layout.addWidget(banner(f"安装版从用户数据目录读取 {SOURCE_FILENAME}。", "muted"))
         box.addWidget(source_panel)
         box.addWidget(banner("制作加密目录", "section"))
         self.rows = QTableWidget(1, 3)
@@ -195,10 +203,11 @@ class CatalogEditor(QWidget):
     def show_source(self, source):
         self.source_url.setText(source.url)
         self.source_key.setText(source.key)
+        self.update_url.setText(source.update_url)
         self.hide_key()
 
     def current_source(self):
-        return CatalogSource(self.source_url.text().strip(), self.source_key.text())
+        return CatalogSource(self.source_url.text().strip(), self.source_key.text(), self.update_url.text().strip())
 
     def hide_key(self):
         self.source_key.setEchoMode(QLineEdit.EchoMode.Password)
@@ -307,7 +316,7 @@ class EndpointChoice(QWidget):
 
 
 class Window(QMainWindow):
-    def __init__(self, data_dir=DATA, *, start_background=True):
+    def __init__(self, data_dir=DATA, *, start_background=True, install_root=None):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} V{APP_VERSION} · 自动代理")
         self.resize(1040, 725)
@@ -316,13 +325,18 @@ class Window(QMainWindow):
         self.source_file = data_dir / SOURCE_FILENAME
         self.catalog_source = CatalogSource()
         self.source_error = ""
+        self.install_root = install_root
+        self.next_update = 0
+        self.pending_update = None
+        self.update_prompt = False
+        self.exit_action = None
+        self.tray = None
         self.events = Events()
         self.events.line.connect(self.write_log)
         self.events.progress.connect(self.show_progress)
-        self.engine = Engine(self.events.line.emit, self.events.progress.emit)
+        self.engine = Engine(self.events.line.emit, self.events.progress.emit, data_dir=data_dir)
         self.job = None
         self.next_sync = 0
-        self.should_close = False
         self.fields = {}
         self.table_results = {}
         self.page_hash = ""
@@ -338,6 +352,7 @@ class Window(QMainWindow):
         self.timer.setInterval(30_000)
         self.timer.timeout.connect(self.tick)
         if start_background:
+            self.setup_tray()
             self.timer.start()
             QTimer.singleShot(0, self.startup)
 
@@ -392,7 +407,7 @@ class Window(QMainWindow):
         content.setSpacing(6)
         self.status = banner("代理尚未启动", "headline")
         self.status.setWordWrap(True)
-        self.detail = banner("初次使用请先一键配置，再一键启动。", "muted")
+        self.detail = banner("点击一键启动，自动检查内核、更新订阅并连接。", "muted")
         self.detail.setWordWrap(True)
         self.warning = banner("", "warning")
         self.warning.setWordWrap(True)
@@ -411,13 +426,12 @@ class Window(QMainWindow):
         content.addWidget(self.warning)
         row = QHBoxLayout()
         row.setContentsMargins(0, 5, 0, 0)
-        self.configure_button = button("一键配置", self.one_click_configure)
         self.auto_button = button("一键启动", lambda: self.with_settings("一键启动", self.engine.auto), True)
         self.stop_button = button("关闭", lambda: self.run_job("关闭代理", self.engine.close))
         self.bad_button = button("这个节点不可用", lambda: self.run_job("切换下一节点", self.engine.next_node))
         self.restart_button = button("重启", lambda: self.with_settings("重启代理", self.engine.restart), True)
         self.cancel_button = button("取消操作", self.cancel_job)
-        for b in (self.configure_button, self.auto_button, self.stop_button, self.bad_button, self.restart_button):
+        for b in (self.auto_button, self.stop_button, self.bad_button, self.restart_button):
             row.addWidget(b)
         row.addWidget(self.cancel_button)
         row.addStretch()
@@ -514,7 +528,9 @@ class Window(QMainWindow):
         mode.currentIndexChanged.connect(self.schedule_save)
         self.fields["check"].presets.currentIndexChanged.connect(self.schedule_save)
         self.fields["check"].custom.textEdited.connect(self.schedule_save)
-        box.addWidget(banner("更改后自动保存到程序目录。", "muted"))
+        self.update_button = button("检查更新", lambda: self.check_updates(manual=True))
+        box.addWidget(self.update_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        box.addWidget(banner("更改后自动保存。软件运行时每天检查一次更新。", "muted"))
         box.addStretch()
         return page
 
@@ -610,10 +626,8 @@ class Window(QMainWindow):
 
     def load_catalog_source(self):
         try:
-            if self.source_file.exists():
-                self.catalog_source = CatalogSource.load(self.source_file)
-            else:
-                self.catalog_source.save(self.source_file)
+            defaults = self.install_root / SOURCE_FILENAME if self.install_root else None
+            self.catalog_source = load_catalog_source(self.source_file, defaults)
         except (VPNError, OSError) as error:
             reason = str(error) if isinstance(error, VPNError) else "无法读取或写入文件"
             self.source_error = f"{SOURCE_FILENAME} 无法使用：{reason}。请在「高级模式」检查目录来源。"
@@ -628,6 +642,8 @@ class Window(QMainWindow):
         source.save(self.source_file)
         if source != self.catalog_source or self.source_error:
             self.next_sync = 0
+        if source.update_url != self.catalog_source.update_url:
+            self.next_update = 0
         if self.source_error:
             self.warning.hide()
         self.source_error = ""
@@ -635,7 +651,7 @@ class Window(QMainWindow):
         self.saved.update(source.settings())
         self.catalog_editor.show_source(source)
         if not self.engine.current:
-            self.detail.setText("目录来源已保存，可一键配置或启动。" if source.configured else
+            self.detail.setText("目录来源已保存，可一键启动。" if source.configured else
                                 "请先在「高级模式」填写或导入目录来源。")
         self.statusBar().showMessage("目录来源已保存", 5000)
         self.events.line.emit("已保存目录来源")
@@ -657,6 +673,8 @@ class Window(QMainWindow):
                 if saved.get("catalog_source_id") == self.catalog_source.identity():
                     self.next_sync = float(saved.get("next_sync", 0))
                 self.engine.last_sync = saved.get("last_sync")
+                if saved.get("update_source_id") == self.update_source_id():
+                    self.next_update = float(saved.get("next_update", 0))
             except Exception:
                 self.events.line.emit("部分设置无法读取，已使用默认值")
         self.apply_fields(data)
@@ -702,6 +720,8 @@ class Window(QMainWindow):
         stored["catalog_source_id"] = self.catalog_source.identity()
         stored["next_sync"] = self.next_sync
         stored["last_sync"] = self.engine.last_sync
+        stored["next_update"] = self.next_update
+        stored["update_source_id"] = self.update_source_id()
         atomic(self.config_file, json.dumps(stored, ensure_ascii=False, indent=2).encode())
         self.saved = data
 
@@ -741,15 +761,16 @@ class Window(QMainWindow):
             self.tick()
 
     def tick(self):
-        if (self.job or self.source_error
-                or time.time() < self.next_sync):
+        if self.job or self.source_error or self.update_prompt:
             return
-        self.run_job("定时更新订阅", lambda: self.engine.refresh(self.saved))
+        if self.install_root and self.catalog_source.update_url and time.time() >= self.next_update:
+            self.check_updates()
+        elif self.catalog_source.configured and time.time() >= self.next_sync:
+            self.run_job("定时更新订阅", lambda: self.engine.refresh(self.saved))
 
     def set_controls(self, busy):
         active = bool(self.engine.current)
         recovery = self.engine.own.journal.exists()
-        self.configure_button.setVisible(not active)
         self.auto_button.setVisible(not active)
         self.stop_button.setVisible(active or recovery)
         self.bad_button.setVisible(active and self.engine.current.verified)
@@ -757,11 +778,13 @@ class Window(QMainWindow):
         self.bad_button.setEnabled(not busy)
         cancellable = busy and self.job_title in (
             "一键启动", "定时更新订阅", "连接测试", "切换下一节点", "重启代理",
-            "导入目录并更新订阅", "应用所选代理")
+            "从本地目录启动", "应用所选代理")
         self.cancel_button.setVisible(cancellable)
         self.cancel_button.setEnabled(cancellable)
-        for item in (self.configure_button, self.auto_button, self.stop_button, self.restart_button):
+        for item in (self.auto_button, self.stop_button, self.restart_button):
             item.setEnabled(not busy)
+        if hasattr(self, "update_button"):
+            self.update_button.setEnabled(not busy)
         for item in (self.vendor, self.group):
             item.setEnabled(not busy and bool(self.engine.profiles))
         for name in ("settings_form", "catalog_editor"):
@@ -808,7 +831,7 @@ class Window(QMainWindow):
 
     @Slot()
     def finished(self):
-        fallback = self.job.download_failed and self.job_title == "一键配置"
+        fallback = self.job.download_failed and self.job_title in ("一键启动", "重启代理")
         self.job.deleteLater()
         self.job = None
         error = self.job_error
@@ -857,14 +880,17 @@ class Window(QMainWindow):
         self.warning.setText("　".join(warnings))
         self.warning.setVisible(bool(warnings))
         self.statusBar().showMessage(f"{self.job_title}失败：{error}" if error else f"{self.job_title}完成", 10000)
-        if fallback:
-            QTimer.singleShot(0, self.import_catalog)
-        if self.should_close:
-            self.should_close = False
-            if error:
+        if self.exit_action:
+            action, self.exit_action = self.exit_action, None
+            if self.job_title == "关闭代理并退出" and error:
+                self.show_window()
                 QMessageBox.warning(self, "未能恢复代理", error)
             else:
-                self.close()
+                QTimer.singleShot(0, lambda: self.finish_exit(action))
+        elif self.job_title == "检查软件更新":
+            QTimer.singleShot(0, lambda: self.update_finished(error))
+        elif fallback:
+            QTimer.singleShot(0, self.import_catalog)
 
     def fill_profiles(self):
         selected = self.vendor.currentData()
@@ -957,66 +983,173 @@ class Window(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "下载失败，请导入本地加密目录", "",
                                                "VPN-X 目录 (*.vxp)")
         if path:
-            self.with_settings("导入目录并更新订阅", lambda s: self.engine.refresh(s, path))
+            self.with_settings("从本地目录启动", lambda s: self.engine.auto(s, path))
 
-    def one_click_configure(self):
-        def run(settings):
-            if self.engine.own.journal.exists():
-                self.events.progress.emit("正在关闭代理", 0, 0)
-                self.engine.close()
-            self.engine.own.stop_headless()
-            self.events.progress.emit("启动本地 Clash 内核", 0, 0)
-            exe = ensure_verge(self.events.line.emit)
-            self.engine.own.prepare(exe)
-            self.engine.refresh(settings)
-        self.with_settings("一键配置", run)
+    def setup_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(self.windowIcon(), self)
+        self.tray.setToolTip("VPN-X 自动代理")
+        menu = QMenu(self)
+        menu.addAction("打开 VPN-X", self.show_window)
+        menu.addAction("关闭代理并退出", self.request_exit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(lambda reason: self.show_window()
+                                    if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                                                  QSystemTrayIcon.ActivationReason.DoubleClick) else None)
+        self.tray.show()
 
-    def closeEvent(self, event):
+    def show_window(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def request_exit(self):
+        self.finish_exit("quit")
+
+    def finish_exit(self, action):
         if self.job:
-            self.detail.setText("当前操作正在执行，请等任务完成后关闭窗口。")
-            event.ignore()
+            self.exit_action = action
+            self.cancel_job()
             return
         if self.save_timer.isActive():
             self.save_timer.stop()
             self.persist_edits()
         if self.engine.own.journal.exists():
-            event.ignore()
-            self.should_close = True
+            self.exit_action = action
             self.run_job("关闭代理并退出", self.engine.close)
             return
         self.engine.own.stop_headless()
-        event.accept()
+        if action == "update":
+            try:
+                subprocess.Popen([sys.executable, "--apply-update", str(os.getpid())],
+                                 cwd=Path(sys.executable).parent)
+            except OSError:
+                self.show_window()
+                QMessageBox.warning(self, "无法更新", "更新程序未能启动，可在设置里重试。")
+                return
+        if self.tray:
+            self.tray.hide()
+        QApplication.instance().quit()
+
+    def update_source_id(self):
+        return hashlib.sha256(self.catalog_source.update_url.encode()).hexdigest()
+
+    def check_updates(self, *, manual=False):
+        if self.job or self.update_prompt:
+            return
+        address = self.catalog_source.update_url
+        if not self.install_root or not address:
+            if manual:
+                QMessageBox.information(self, "检查软件更新", "请使用安装版，并在高级模式设置 HTTPS 更新清单链接。")
+            return
+        try:
+            if updates.current_version(self.install_root) != APP_VERSION:
+                return  # The updater has not yet committed this newly started version.
+        except (OSError, ValueError, VPNError):
+            self.next_update = time.time() + 86400
+            if manual:
+                QMessageBox.warning(self, "检查软件更新", "无法读取当前安装版本，请检查安装目录。")
+            return
+        self.next_update = time.time() + 86400
+        self.pending_update = None
+        self.update_manual = manual
+        self.update_prompt = True
+        def run():
+            self.pending_update = updates.check(self.install_root, address, self.events.progress.emit,
+                                                self.engine.cancelled)
+        self.run_job("检查软件更新", run)
+
+    def update_finished(self, error):
+        retry = install = False
+        if error:
+            self.show_window()
+            retry = QMessageBox.question(self, "更新下载失败", f"{error}\n\n是否重试？",
+                                         defaultButton=QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes
+        elif self.pending_update:
+            self.show_window()
+            prompt = QMessageBox(self)
+            prompt.setWindowTitle("更新已就绪")
+            prompt.setText(f"V{self.pending_update.version} 已下载并通过校验。\n\n现在关闭代理、安装更新并重启 VPN-X？")
+            now = prompt.addButton("现在更新", QMessageBox.ButtonRole.AcceptRole)
+            prompt.setDefaultButton(prompt.addButton("稍后", QMessageBox.ButtonRole.RejectRole))
+            prompt.exec()
+            install = prompt.clickedButton() is now
+        elif self.update_manual:
+            QMessageBox.information(self, "检查软件更新", "当前已经是最新版本。")
+        self.update_prompt = False
+        if install:
+            self.finish_exit("update")
+        elif retry:
+            self.check_updates(manual=True)
+
+    def closeEvent(self, event):
+        event.ignore()
+        if self.tray:
+            self.hide()
+        else:
+            self.showMinimized()
 
 
 def migrate_data(data_dir):
     for old_name, new_name in (("settings.json", "settings.json"), ("restore.json.dpapi", "restore.json.dpapi")):
         old = LEGACY_DATA / old_name
         new = data_dir / new_name
-        if old.is_file() and not new.exists():
+        if old != new and old.is_file() and not new.exists():
             atomic(new, old.read_bytes())
             if old_name == "restore.json.dpapi":
                 old.unlink()
 
 
-def run_window(app, data_dir, *, check_startup=False):
+def run_window(app, data_dir, *, check_startup=False, install_root=None, health=None, update_failed=False):
     lock_dir = data_dir if check_startup else LEGACY_DATA
     lock_dir.mkdir(parents=True, exist_ok=True)
+    channel = "VPN-X-" + hashlib.sha256(str(lock_dir).lower().encode()).hexdigest()[:24]
     lock = QLockFile(str(lock_dir / "vpn-x.lock"))
     lock.setStaleLockTime(0)
     if not lock.tryLock(0):
-        QMessageBox.information(None, "VPN-X", "VPN-X 已在运行。")
-        return 1
+        socket = QLocalSocket()
+        socket.connectToServer(channel)
+        return 0 if socket.waitForConnected(1000) and not health else 1
     try:
         if not check_startup:
             try:
+                data_dir.mkdir(exist_ok=True, parents=True)
                 migrate_data(data_dir)
-            except OSError as err:
-                QMessageBox.warning(None, "VPN-X", f"无法写入程序目录：{err}")
+            except (OSError, VPNError) as err:
+                if not health:
+                    QMessageBox.warning(None, "VPN-X", f"无法写入数据目录：{err}")
                 return 1
-        window = Window(data_dir, start_background=not check_startup)
+        app.setQuitOnLastWindowClosed(False)
+        window = Window(data_dir, start_background=not check_startup, install_root=install_root)
+        server = QLocalServer(window)
+        server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+        if not check_startup:
+            QLocalServer.removeServer(channel)
+            server.listen(channel)
+            def reopen():
+                connection = server.nextPendingConnection()
+                if connection:
+                    connection.deleteLater()
+                window.show_window()
+            server.newConnection.connect(reopen)
+            def session_end(manager):
+                # Do not block Windows waiting on a network task. The DPAPI journal remains
+                # available for crash recovery on the next launch if cleanup cannot finish.
+                if not window.job:
+                    try:
+                        window.engine.close()
+                    except Exception:
+                        pass
+            app.commitDataRequest.connect(session_end)
         if check_startup:
             window.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
             QTimer.singleShot(0, lambda: app.exit(0))
+        elif health:
+            QTimer.singleShot(0, lambda: atomic(health, b"ready"))
+        elif update_failed:
+            QTimer.singleShot(0, lambda: QMessageBox.warning(window, "软件更新失败",
+                              "已保留原版本。可在设置中重新检查更新。"))
         window.show()
         return app.exec()
     finally:
@@ -1024,6 +1157,10 @@ def run_window(app, data_dir, *, check_startup=False):
 
 
 def main():
+    root = updates.installed_root()
+    args = sys.argv[1:]
+    if len(args) == 2 and args[0] == "--apply-update" and root and args[1].isdigit():
+        return updates.apply_pending(root, int(args[1]))
     if sys.argv[1:] == ["--check-clash"]:
         with Bench(find_verge(), lambda *_: None) as runtime:
             return 0 if runtime.core.call("GET", "/version").get("meta") else 1
@@ -1051,7 +1188,11 @@ def main():
             QMessageBox.warning(None, "需要管理员权限", "请允许 Windows 提权，以便控制 Clash Verge 和虚拟网卡。")
             return 1
         return 0
-    return run_window(app, DATA)
+    health = None
+    if root and len(args) == 2 and args[0] == "--update-health" and re.fullmatch(r"[a-f0-9]{24}", args[1]):
+        health = root / "updates" / ("health-" + args[1])
+    return run_window(app, LEGACY_DATA if root else DATA, install_root=root, health=health,
+                      update_failed=args == ["--update-failed"])
 
 
 if __name__ == "__main__":

@@ -5,6 +5,10 @@ param(
     [string]$OutputDirectory = '',
     [string]$SevenZip = '',
     [string]$CatalogSource = '',
+    [string]$ISCC = '',
+    [string]$ChineseMessages = '',
+    [string]$UpdatePublicKey = '',
+    [string]$UpdateUrl = '',
     [switch]$MaskCatalogSource
 )
 
@@ -49,6 +53,24 @@ try {
         throw '7-Zip is needed to unpack the official installer. Pass -SevenZip with the path to 7z.exe.'
     }
     $SevenZip = (Resolve-Path -LiteralPath $SevenZip).ProviderPath
+    $SevenZipDll = Join-Path (Split-Path -Parent $SevenZip) '7z.dll'
+    $SevenZipLicense = Join-Path (Split-Path -Parent $SevenZip) 'License.txt'
+    if (-not (Test-Path -LiteralPath $SevenZipDll -PathType Leaf)) { throw 'Use the full 7-Zip CLI with 7z.dll.' }
+    if (-not (Test-Path -LiteralPath $SevenZipLicense -PathType Leaf)) { throw 'Use the 7-Zip distribution including License.txt.' }
+    if (-not $ISCC) {
+        $ISCC = (Get-Command ISCC.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+        if (-not $ISCC) { $ISCC = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe' }
+    }
+    $ISCC = (Get-Item -LiteralPath $ISCC).FullName
+    if (-not $ChineseMessages) {
+        $ChineseMessages = Join-Path (Split-Path -Parent $ISCC) 'Languages\ChineseSimplified.isl'
+    }
+    $ChineseMessages = (Get-Item -LiteralPath $ChineseMessages).FullName
+    $csc = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    if ($UpdatePublicKey) {
+        $UpdatePublicKey = (Get-Item -LiteralPath $UpdatePublicKey).FullName
+        if ((Get-Item -LiteralPath $UpdatePublicKey).Length -ne 32) { throw 'Expected a raw Ed25519 public key (32 bytes).' }
+    } elseif ($UpdateUrl) { throw 'Passing -UpdateUrl requires -UpdatePublicKey.' }
     $null = New-Item -ItemType Directory -Path $bundleDir -Force
     $destination = Join-Path $bundleDir $package.Name
     if ($package.FullName -ne $destination) {
@@ -79,6 +101,7 @@ try {
         }
     }
     $versionTuple = $appVersion.Replace('.', ',') + ',0,0'
+    $exeName = 'VPN-X.exe'
     $versionResource = [IO.Path]::GetTempFileName()
     $versionInfo = @"
 VSVersionInfo(
@@ -89,14 +112,19 @@ VSVersionInfo(
       StringStruct('FileVersion', '$appVersion'),
       StringStruct('ProductName', 'VPN-X'),
       StringStruct('ProductVersion', '$appVersion'),
-      StringStruct('OriginalFilename', '$releaseName.exe')
+      StringStruct('OriginalFilename', '$exeName')
     ])]), VarFileInfo([VarStruct('Translation', [1033, 1200])])]
 )
 "@
     $buildArgs = @('--noconfirm', '--clean', '--onedir', '--windowed',
-                   '--name', $releaseName, '--distpath', $outputRoot, '--version-file', $versionResource,
+                   '--name', 'VPN-X', '--distpath', (Join-Path $outputRoot 'payload'), '--version-file', $versionResource,
                    '--icon', $logo, '--add-data', "$logo;.",
-                   '--add-data', "$destination;installers", 'vpn_x.py')
+                   '--add-data', "$destination;installers")
+    if ($UpdatePublicKey) {
+        if ((Split-Path -Leaf $UpdatePublicKey) -ne 'update-public-key.bin') { throw 'Name the raw public key update-public-key.bin.' }
+        $buildArgs += @('--add-data', "$UpdatePublicKey;.")
+    }
+    $buildArgs += 'vpn_x.py'
     $previousPath = $env:Path
     try {
         [IO.File]::WriteAllText($versionResource, $versionInfo)
@@ -107,7 +135,7 @@ VSVersionInfo(
             throw "PyInstaller failed ($LASTEXITCODE)."
         }
 
-        $release = Join-Path $outputRoot $releaseName
+        $release = Join-Path $outputRoot 'payload\VPN-X'
         $shadowDll = Get-ChildItem -LiteralPath $release -Recurse -File |
             Where-Object { $_.Name -in 'icu.dll', 'icuuc.dll', 'icuin.dll' } |
             Select-Object -First 1
@@ -119,29 +147,46 @@ VSVersionInfo(
         if ($LASTEXITCODE) {
             throw 'Could not unpack the Clash Verge runtime into the release.'
         }
-        $sourceTarget = Join-Path $release 'catalog-source.json'
+        $sevenZipRuntime = Join-Path $release '7zip'
+        $null = New-Item -ItemType Directory -Path $sevenZipRuntime -Force
+        Copy-Item -LiteralPath $SevenZip -Destination (Join-Path $sevenZipRuntime '7z.exe')
+        Copy-Item -LiteralPath $SevenZipDll -Destination $sevenZipRuntime
+        Copy-Item -LiteralPath $SevenZipLicense -Destination $sevenZipRuntime
+        $sourceTarget = Join-Path $outputRoot 'catalog-source.json'
         if ($MaskCatalogSource) {
-            & $pythonExe -c 'import sys; from catalog import CatalogSource; CatalogSource().save(sys.argv[1])' $sourceTarget
+            & $pythonExe -c 'import sys; from catalog import CatalogSource; CatalogSource(update_url=(sys.argv[2:] or [""])[0]).save(sys.argv[1])' $sourceTarget "$UpdateUrl"
         } else {
-            & $pythonExe -c 'import sys; from catalog import CatalogSource; CatalogSource.load(sys.argv[1]).save(sys.argv[2])' $CatalogSource $sourceTarget
+            & $pythonExe -c 'import sys; from dataclasses import replace; from catalog import CatalogSource; source = CatalogSource.load(sys.argv[1]); replace(source, update_url=(sys.argv[3:] or [""])[0] or source.update_url).save(sys.argv[2])' $CatalogSource $sourceTarget "$UpdateUrl"
         }
         if ($LASTEXITCODE) {
             throw 'Could not prepare catalog-source.json.'
         }
-        $exe = Join-Path $release "$releaseName.exe"
+        if (-not $UpdatePublicKey) {
+            & $pythonExe -c 'import sys; from catalog import CatalogSource; sys.exit(bool(CatalogSource.load(sys.argv[1]).update_url))' $sourceTarget
+            if ($LASTEXITCODE) { throw 'A configured update URL requires -UpdatePublicKey.' }
+        }
+        $exe = Join-Path $release $exeName
         & $pythonExe -c 'import subprocess, sys; [subprocess.run([sys.argv[1], check], timeout=20, check=True) for check in ("--check-startup", "--check-clash")]' $exe
         if ($LASTEXITCODE) {
             throw 'The packaged VPN-X executable or its local Clash runtime did not pass the startup check.'
         }
         Copy-Item -LiteralPath 'README.md' -Destination (Join-Path $release 'README.md') -Force
+        $launcher = Join-Path $outputRoot 'VPN-X-launcher.exe'
+        $setup = Join-Path $outputRoot "$releaseName-Setup.exe"
+        & $csc /nologo /target:winexe /optimize+ /reference:System.Windows.Forms.dll "/win32icon:$logo" "/out:$launcher" 'launcher.cs'
+        if ($LASTEXITCODE) { throw 'Could not build the VPN-X launcher.' }
+        & $ISCC /Qp "/DAppVersion=$appVersion" "/DAppIcon=$logo" "/DOutputFolder=$outputRoot" "/DLauncher=$launcher" "/DPayload=$release" "/DCatalogSource=$sourceTarget" "/DChineseMessages=$ChineseMessages" 'installer.iss'
+        if ($LASTEXITCODE) { throw 'Could not build the VPN-X installer.' }
+        Write-Output $setup
         $zipScript = @'
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
 import sys
 
 root = Path(sys.argv[1])
-target = root.parent / (root.name + ".zip")
+target = Path(sys.argv[2])
 temporary = target.with_suffix(".zip.tmp")
+from updates import archive_files
 try:
     with ZipFile(temporary, "w", ZIP_DEFLATED, compresslevel=4) as bundle:
         for file in sorted(root.rglob("*")):
@@ -150,12 +195,13 @@ try:
     with ZipFile(temporary) as bundle:
         if bundle.testzip() is not None:
             raise RuntimeError("Archive integrity check failed.")
+    archive_files(temporary)
     temporary.replace(target)
 finally:
     temporary.unlink(missing_ok=True)
 print(target)
 '@
-        & $pythonExe -c $zipScript $release
+        & $pythonExe -c $zipScript $release (Join-Path $outputRoot "$releaseName-Update.zip")
         if ($LASTEXITCODE) {
             throw 'Could not create the release ZIP.'
         }
