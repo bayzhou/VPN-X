@@ -67,6 +67,9 @@ try {
     }
     $ChineseMessages = (Get-Item -LiteralPath $ChineseMessages).FullName
     $csc = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    if ($MaskCatalogSource -and ($UpdatePublicKey -or $UpdateUrl)) {
+        throw 'The public installer must not include a private update source or its public key. Build the update package separately.'
+    }
     if ($UpdatePublicKey) {
         $UpdatePublicKey = (Get-Item -LiteralPath $UpdatePublicKey).FullName
         if ((Get-Item -LiteralPath $UpdatePublicKey).Length -ne 32) { throw 'Expected a raw Ed25519 public key (32 bytes).' }
@@ -154,7 +157,7 @@ VSVersionInfo(
         Copy-Item -LiteralPath $SevenZipLicense -Destination $sevenZipRuntime
         $sourceTarget = Join-Path $outputRoot 'catalog-source.json'
         if ($MaskCatalogSource) {
-            & $pythonExe -c 'import sys; from catalog import CatalogSource; CatalogSource(update_url=(sys.argv[2:] or [""])[0]).save(sys.argv[1])' $sourceTarget "$UpdateUrl"
+            & $pythonExe -c 'import sys; from catalog import CatalogSource; CatalogSource().save(sys.argv[1])' $sourceTarget
         } else {
             & $pythonExe -c 'import sys; from dataclasses import replace; from catalog import CatalogSource; source = CatalogSource.load(sys.argv[1]); replace(source, update_url=(sys.argv[3:] or [""])[0] or source.update_url).save(sys.argv[2])' $CatalogSource $sourceTarget "$UpdateUrl"
         }
@@ -178,6 +181,7 @@ VSVersionInfo(
         & $ISCC /Qp "/DAppVersion=$appVersion" "/DAppIcon=$logo" "/DOutputFolder=$outputRoot" "/DLauncher=$launcher" "/DPayload=$release" "/DCatalogSource=$sourceTarget" "/DChineseMessages=$ChineseMessages" 'installer.iss'
         if ($LASTEXITCODE) { throw 'Could not build the VPN-X installer.' }
         Write-Output $setup
+        if ($MaskCatalogSource) { return }
         $zipScript = @'
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
