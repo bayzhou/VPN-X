@@ -11,7 +11,7 @@ from catalog import (
 )
 from verge import Bench, DATA, Ownership, find_verge
 
-DEFAULTS = dict(PUBLIC_SETTINGS, **CatalogSource().settings())
+DEFAULTS = dict(PUBLIC_SETTINGS, direct_hosts="", **CatalogSource().settings())
 
 
 def preferred_regions(settings):
@@ -30,6 +30,7 @@ class Candidate:
 
     def sort_key(self, priorities):
         return (region_rank(self.node.name, priorities),
+                self.vendor.priority if self.vendor.priority is not None else float("inf"),
                 -(self.quota if self.quota is not None else -1),
                 self.delay if self.delay is not None else float("inf"),
                 self.vendor.name, self.node.name)
@@ -227,7 +228,7 @@ class Engine:
                     self.progress("测试节点延迟", completed, len(tasks))
         self.progress("排序候选节点", 0, 0)
         self.results.sort(key=lambda c: c.sort_key(preferred_regions(settings)))
-        self.log(f"已排序 {len(self.results)} 个节点：地区优先级 → 订阅剩余流量 → 连接延迟")
+        self.log(f"已排序 {len(self.results)} 个节点：地区优先级 → 厂商优先级 → 订阅剩余流量 → 连接延迟")
 
     def auto(self, settings):
         self.refresh(settings, stale=True)

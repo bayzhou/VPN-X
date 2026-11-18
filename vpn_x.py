@@ -25,8 +25,8 @@ from app_info import APP_NAME, APP_VERSION, RELEASE_NAME
 from automation import DEFAULTS, Engine
 from catalog import (
     CLOUDFLARE_CHECK, DEFAULT_CHECK, PUBLIC_SETTINGS, SOURCE_FILENAME,
-    CatalogDownloadError, CatalogSource, VPNError, atomic, catalog_settings, check_page_password, encrypt,
-    page_password_hash,
+    CatalogDownloadError, CatalogSource, VPNError, atomic, catalog_settings, check_page_password,
+    direct_hosts, encrypt, page_password_hash,
 )
 from verge import Bench, DATA, LEGACY_DATA, ensure_verge, find_verge
 
@@ -173,12 +173,13 @@ class CatalogEditor(QWidget):
         source_layout.addWidget(banner(f"将 {SOURCE_FILENAME} 与 {RELEASE_NAME}.exe 放在同一目录即可自动读取。", "muted"))
         box.addWidget(source_panel)
         box.addWidget(banner("制作加密目录", "section"))
-        self.rows = QTableWidget(1, 2)
+        self.rows = QTableWidget(1, 3)
         self.rows.setShowGrid(False)
         self.rows.verticalHeader().setDefaultSectionSize(38)
-        self.rows.setHorizontalHeaderLabels(["VPN 厂商", "HTTPS 订阅链接"])
+        self.rows.setHorizontalHeaderLabels(["VPN 厂商", "HTTPS 订阅链接", "厂商优先级"])
         self.rows.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.rows.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.rows.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.rows.setColumnWidth(0, 150)
         box.addWidget(self.rows, 1)
         bar = QHBoxLayout()
@@ -188,7 +189,8 @@ class CatalogEditor(QWidget):
         bar.addWidget(button("修改进入密码", parent.change_page_password))
         bar.addWidget(button("导出 .vxp", self.save, True))
         box.addLayout(bar)
-        box.addWidget(banner("导出文件会包含订阅和当前软件配置。", "muted"))
+        box.addWidget(banner("厂商优先级填 1–999，数字越小越优先；留空排在已设置的厂商之后。", "muted"))
+        box.addWidget(banner("导出文件会包含订阅、厂商优先级和可同步的软件配置。", "muted"))
 
     def show_source(self, source):
         self.source_url.setText(source.url)
@@ -244,13 +246,15 @@ class CatalogEditor(QWidget):
             self.rows.removeRow(row)
 
     def save(self):
-        rows = []
-        for row in range(self.rows.rowCount()):
-            parts = [self.rows.item(row, col).text().strip() if self.rows.item(row, col) else ""
-                     for col in range(2)]
-            if any(parts):
-                rows.append(dict(zip(("name", "url"), parts)))
         try:
+            rows = []
+            for row in range(self.rows.rowCount()):
+                name, address, priority = [self.rows.item(row, col).text().strip()
+                                           if self.rows.item(row, col) else "" for col in range(3)]
+                if name or address or priority:
+                    if priority and not re.fullmatch(r"[0-9]{1,3}", priority):
+                        raise VPNError(f"第 {row + 1} 行的厂商优先级须为 1–999 的整数，或留空")
+                    rows.append({"name": name, "url": address, "priority": int(priority) if priority else None})
             source = self.current_source()
             if not source.configured:
                 raise VPNError("请先填写 VXP 链接和密钥")
@@ -497,8 +501,14 @@ class Window(QMainWindow):
         mode.addItem("规则", "rule")
         mode.addItem("全局", "global")
         form.addRow("代理模式", mode)
+        exceptions = self.fields["direct_hosts"] = QLineEdit()
+        exceptions.setMaxLength(2000)
+        exceptions.setPlaceholderText("例如：*.office.example.com, 10.1.2.3")
+        exceptions.setToolTip("规则模式下直连；使用 Windows 系统代理时，也加入系统代理例外。仅保存到本机。")
+        form.addRow("自定义直连地址", exceptions)
         box.addWidget(self.settings_form)
         regions.textEdited.connect(self.schedule_save)
+        exceptions.textEdited.connect(self.schedule_save)
         hours.valueChanged.connect(self.schedule_save)
         net.currentIndexChanged.connect(self.schedule_save)
         mode.currentIndexChanged.connect(self.schedule_save)
@@ -551,12 +561,14 @@ class Window(QMainWindow):
             return
         self.page_error.clear()
         table = self.catalog_editor.rows
-        if table.rowCount() == 1 and all(table.item(0, col) is None for col in range(2)):
+        if table.rowCount() == 1 and all(table.item(0, col) is None for col in range(table.columnCount())):
             for index, vendor in enumerate(self.engine.catalog or []):
                 if index:
                     table.insertRow(index)
                 table.setItem(index, 0, QTableWidgetItem(vendor.name))
                 table.setItem(index, 1, QTableWidgetItem(vendor.url))
+                if vendor.priority is not None:
+                    table.setItem(index, 2, QTableWidgetItem(str(vendor.priority)))
         self.catalog_stack.setCurrentIndex(1)
 
     def change_page_password(self):
@@ -639,6 +651,9 @@ class Window(QMainWindow):
                 if not saved.get("endpoint_presets") and saved.get("check") == CLOUDFLARE_CHECK:
                     saved["check"] = DEFAULT_CHECK
                 data.update(catalog_settings({k: saved[k] for k in PUBLIC_SETTINGS if k in saved}))
+                exceptions = saved.get("direct_hosts", "")
+                direct_hosts(exceptions)
+                data["direct_hosts"] = exceptions
                 if saved.get("catalog_source_id") == self.catalog_source.identity():
                     self.next_sync = float(saved.get("next_sync", 0))
                 self.engine.last_sync = saved.get("last_sync")
@@ -672,7 +687,9 @@ class Window(QMainWindow):
                 result[key] = field.value()
             else:
                 result[key] = field.text().strip()
-        return dict(catalog_settings(result), **self.catalog_source.settings())
+        exceptions = result.pop("direct_hosts")
+        direct_hosts(exceptions)
+        return dict(catalog_settings(result), direct_hosts=exceptions, **self.catalog_source.settings())
 
     def save_settings(self, data):
         if hasattr(self, "saved") and any(data[k] != self.saved[k] for k in ("catalog", "password", "hours")):

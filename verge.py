@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -27,7 +28,7 @@ import win32job
 import win32pipe
 import yaml
 
-from catalog import VPNError, atomic, protect, url
+from catalog import VPNError, atomic, direct_hosts, protect, url
 
 VERGE_APP_ID = "io.github.clash-verge-rev.clash-verge-rev"
 VERGE_HOME = Path(os.environ["APPDATA"]) / VERGE_APP_ID
@@ -37,6 +38,10 @@ ACTIVE = "VPN-X 出口"
 HIDDEN = "vx-managed-session"
 CREATE_NO_WINDOW = 0x08000000
 INSTALLER_NAME = re.compile(r"Clash[. ]Verge_(\d+\.\d+\.\d+)_x64-setup\.exe", re.IGNORECASE)
+LOCAL_DOMAINS = ("localhost", "local", "lan", "home.arpa")
+LOCAL_NETWORKS = ("127.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16",
+                  "172.16.0.0/12", "192.168.0.0/16", "::1/128", "fc00::/7", "fe80::/10")
+GEO_ASSETS = ("geosite.dat", "Country.mmdb")
 
 
 class PipeIO(io.RawIOBase):
@@ -270,13 +275,14 @@ def _listener(name, port, group, credential):
 
 class Bench:
     """Temporary loopback core; no TUN or system proxy changes."""
-    def __init__(self, verge_exe, log, *, purpose="连接测试"):
+    def __init__(self, verge_exe, log, *, purpose="连接测试", with_geo=False):
         self.exe = verge_exe.with_name("verge-mihomo.exe")
         self.log = log
         self.root = None
         self.process = None
         self.job = None
         self.purpose = purpose
+        self.with_geo = with_geo
         if (not self.exe.is_file()
                 or self.exe.resolve().parent != DATA.resolve() / "clash"):
             raise VPNError("找不到程序目录 clash 中的 verge-mihomo.exe")
@@ -284,6 +290,11 @@ class Bench:
     def __enter__(self):
         self.root = tempfile.TemporaryDirectory(prefix="bench-", dir=DATA)
         try:
+            if self.with_geo:
+                for name in GEO_ASSETS:
+                    asset = self.exe.parent / "resources" / name
+                    if asset.is_file():
+                        shutil.copyfile(asset, Path(self.root.name) / name)
             control, = free_ports(1)
             secret = secrets.token_urlsafe(24)
             address = f"127.0.0.1:{control}"
@@ -378,7 +389,18 @@ def win_proxy(values=None):
                 free(opt.value.text)
 
 
-def active_config(profiles, doc, settings, mixed, probe, token):
+def proxy_bypass(previous, direct):
+    domains, addresses = direct
+    entries = ["<local>", "127.*", "10.*", "169.254.*", "192.168.*",
+               *(f"172.{second}.*" for second in range(16, 32))]
+    for name in (*LOCAL_DOMAINS, *domains):
+        entries.extend((name, f"*.{name}"))
+    entries.extend(f"[{ip}]" if ":" in ip else ip for ip in ("::1", *addresses))
+    entries.extend(x.strip() for x in previous.split(";") if x.strip())
+    return ";".join(dict((entry.casefold(), entry) for entry in entries).values())
+
+
+def active_config(profiles, doc, settings, mixed, probe, token, *, geo, direct):
     routing = []
     proxies, groups = {}, []
     for p in profiles:
@@ -401,22 +423,34 @@ def active_config(profiles, doc, settings, mixed, probe, token):
     except ValueError:
         check_rule = f"DOMAIN,{check_host.encode('idna').decode()},{ACTIVE}"
     tun = settings["network"] == "tun"
+    domains, addresses = direct
+    domains = list(dict.fromkeys((*LOCAL_DOMAINS, *domains)))
+    networks = list(dict.fromkeys((*LOCAL_NETWORKS,
+                                  *(str(ipaddress.ip_network(ip)) for ip in addresses))))
+    direct_rules = [f"DOMAIN-SUFFIX,{host},DIRECT" for host in domains]
+    direct_rules += [f"IP-CIDR{'6' if ':' in cidr else ''},{cidr},DIRECT,no-resolve" for cidr in networks]
+    direct_rules.append("DOMAIN-SUFFIX,cn,DIRECT")
+    if "geosite.dat" in geo:
+        direct_rules.append("GEOSITE,cn,DIRECT")
+    if "Country.mmdb" in geo:
+        # Known destination IPs can use GEOIP without waiting for a DNS lookup on every proxy request.
+        direct_rules.append("GEOIP,CN,DIRECT,no-resolve")
+    dns_domains = [f"+.{host}" for host in domains]
     config = {
         "mode": settings["mode"], "allow-lan": False, "bind-address": "127.0.0.1",
         "mixed-port": mixed, "log-level": "warning", "profile": {"store-selected": False},
+        "geodata-mode": False, "geo-auto-update": False,
         "tun": {"enable": False, "stack": "mixed", "auto-route": True, "strict-route": True,
+                "dns-mode": "native", "route-exclude-address": networks,
                 "auto-detect-interface": True, "dns-hijack": ["any:53", "tcp://any:53"]},
         "dns": {"enable": tun, "enhanced-mode": "fake-ip", "fake-ip-range": "198.18.0.1/16",
-                "fake-ip-filter": ["*.lan", "*.local", "localhost"],
+                "fake-ip-filter": dns_domains,
+                "nameserver-policy": dict.fromkeys(dns_domains, "system"),
+                "direct-nameserver": ["system"],
                 "nameserver": ["223.5.5.5", "1.1.1.1"]},
         "listeners": [_listener("vx-probe", probe, ACTIVE, token)],
         "proxies": list(proxies.values()), "proxy-groups": groups,
-        "rules": [check_rule, "DOMAIN-SUFFIX,localhost,DIRECT",
-                  "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
-                  "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve", "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
-                  "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve", "IP-CIDR,169.254.0.0/16,DIRECT,no-resolve",
-                  "IP-CIDR6,::1/128,DIRECT,no-resolve", "IP-CIDR6,fc00::/7,DIRECT,no-resolve",
-                  f"MATCH,{ACTIVE}"],
+        "rules": [check_rule, *direct_rules, f"MATCH,{ACTIVE}"],
     }
     for k in ("external-controller", "external-controller-pipe", "secret", "external-controller-cors"):
         if k in doc:
@@ -446,7 +480,7 @@ class Ownership:
             return
         self.stop_headless()
         try:
-            self.headless = Bench(exe, self.log, purpose="Clash Verge").__enter__()
+            self.headless = Bench(exe, self.log, purpose="Clash Verge", with_geo=True).__enter__()
             return
         except (OSError, pywintypes.error, VPNError):
             self.log("后台内核启动失败，改用 Clash Verge 窗口")
@@ -460,8 +494,10 @@ class Ownership:
             self.core = self.headless.core
             doc = self.headless.base
             runtime = json.dumps(doc)
+            geo_home = Path(self.headless.root.name)
         else:
             self.core, runtime, doc = connect_verge(self.log, exe)
+            geo_home = VERGE_HOME
         live = self.core.call("GET", "/configs")
         existing = self.core.proxies()
         if HIDDEN in existing:
@@ -470,12 +506,17 @@ class Ownership:
                     if p.get("type") == "Selector" and p.get("now") in p.get("all", [])}
         mixed, probe = free_ports(2)
         token = secrets.token_urlsafe(20)
-        config, self.group_keys = active_config(profiles, doc, settings, mixed, probe, token)
+        geo = {name for name in GEO_ASSETS if (geo_home / name).is_file()}
+        if len(geo) != len(GEO_ASSETS) and settings["mode"] == "rule":
+            self.log("未找到完整国内分流数据；请检查发布包的 clash/resources 目录")
+        direct = direct_hosts(settings.get("direct_hosts", ""))
+        config, self.group_keys = active_config(profiles, doc, settings, mixed, probe, token,
+                                              geo=geo, direct=direct)
         self.session_id = "vx-session-" + secrets.token_hex(12)
         config["proxy-groups"].append({"name": self.session_id, "type": "select",
                                        "hidden": True, "proxies": [ACTIVE]})
         before = win_proxy()
-        after = ([3, f"127.0.0.1:{mixed}", "<local>", ""]
+        after = ([3, f"127.0.0.1:{mixed}", proxy_bypass(before[2], direct), ""]
                  if settings["network"] == "system" else [1, "", "", ""])
         entry = {"runtime": runtime, "mode": live["mode"], "tun": live.get("tun", {}).get("enable", False),
                  "selected": selected, "before": before, "after": after, "marker": self.session_id,
@@ -483,6 +524,10 @@ class Ownership:
         atomic(self.journal, protect(json.dumps(entry).encode()).encode())
         self.log("已保存 Clash Verge 运行配置、已选节点和 Windows 代理设置")
         self.core.reload(config)
+        if settings["mode"] == "rule":
+            self.log("规则分流：本机、内网、国内域名/IP 和自定义例外直连")
+        if settings["network"] == "system":
+            self.log("系统代理将保留原有例外，并补充本机、常见内网和自定义地址")
         self.probe = f"http://vpnx:{token}@127.0.0.1:{probe}"
         self.mixed = mixed
         self.after = after

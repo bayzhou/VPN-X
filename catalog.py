@@ -36,6 +36,34 @@ class CatalogDownloadError(VPNError):
     pass
 
 
+def direct_hosts(value):
+    """Validate local exceptions; return normalized domain suffixes and individual IPs."""
+    if not isinstance(value, str) or len(value) > 2000:
+        raise VPNError("直连地址最多 2000 个字符")
+    domains, addresses = [], []
+    for part in re.split(r"[\s,，;；]+", value):
+        if not part:
+            continue
+        try:
+            if "%" in part:
+                raise ValueError
+            addresses.append(str(ipaddress.ip_address(part)))
+            continue
+        except ValueError:
+            pass
+        try:
+            host = part.removeprefix("*.").removesuffix(".").encode("idna").decode().lower()
+        except UnicodeError:
+            host = ""
+        if (not host or len(host) > 253
+                or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                           for label in host.split("."))
+                or all(c in "0123456789." for c in host)):
+            raise VPNError("直连地址请输入域名、*.域名或单个 IP，多个地址用逗号分隔")
+        domains.append(host)
+    return list(dict.fromkeys(domains)), list(dict.fromkeys(addresses))
+
+
 def catalog_settings(value):
     if not isinstance(value, dict) or not value.keys() <= PUBLIC_SETTINGS.keys():
         raise VPNError("目录中的软件配置格式无效")
@@ -164,6 +192,7 @@ def request_data(address, *, limit=MAX_DOWNLOAD, seconds=18, proxy=None, revalid
 class Vendor:
     name: str
     url: str
+    priority: int | None = None
 
     @property
     def id(self):
@@ -181,7 +210,10 @@ def vendors(rows):
         if not name or name.casefold() in names:
             raise VPNError("厂商名称不能为空或重复")
         names.add(name.casefold())
-        result.append(Vendor(name, url(row.get("url"), https=True)))
+        priority = row.get("priority")
+        if priority is not None and (type(priority) is not int or not 1 <= priority <= 999):
+            raise VPNError(f"{name} 的优先级须为 1–999 的整数，或留空")
+        result.append(Vendor(name, url(row.get("url"), https=True), priority))
     return result
 
 
@@ -194,7 +226,7 @@ def _key(password, salt):
 def encrypt(rows, password, settings=None):
     if len(password) < 12:
         raise VPNError("制作文件时请使用至少 12 个字符的密钥")
-    values = [asdict(v) for v in vendors(rows)]
+    values = [{k: val for k, val in asdict(v).items() if val is not None} for v in vendors(rows)]
     if settings is not None:
         values = {"vendors": values, "settings": catalog_settings(settings)}
     salt, nonce = secrets.token_bytes(16), secrets.token_bytes(12)
