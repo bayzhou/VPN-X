@@ -499,6 +499,14 @@ def parse_profile(vendor, doc, quota, log, fetch):
         raise VPNError("未找到可用的代理节点")
     if not groups:
         groups["全部节点"] = list(nodes.values())
+    else:
+        grouped = {node.key for members in groups.values() for node in members}
+        remaining_nodes = [node for node in nodes.values() if node.key not in grouped]
+        if remaining_nodes:
+            name = "未分组节点"
+            while name in groups:
+                name += "（其他）"
+            groups[name] = remaining_nodes
     return Profile(vendor, nodes, groups, quota)
 
 

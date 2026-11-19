@@ -166,12 +166,21 @@ class Core:
     def proxies(self):
         return self.call("GET", "/proxies")["proxies"]
 
+    def proxy_info(self, name):
+        return self.call("GET", "/proxies/" + quote(name, safe=""))
+
     def select(self, group, node):
         self.call("PUT", "/proxies/" + quote(group, safe=""), {"name": node})
 
     def delay(self, node, address):
         params = urlencode({"url": address, "timeout": 4500, "expected": "200-299"})
-        return self.call("GET", f"/proxies/{quote(node, safe='')}/delay?{params}", timeout=6)["delay"]
+        delay = self.call("GET", f"/proxies/{quote(node, safe='')}/delay?{params}", timeout=6)["delay"]
+        # Mihomo can return a positive API delay even when the response status did
+        # not match expected. Verify the per-URL history from that same request.
+        state = self.proxy_info(node).get("extra", {}).get(address, {})
+        if not state.get("alive") or not state.get("history") or state["history"][-1].get("delay") != delay:
+            raise VPNError("测试地址未返回 HTTP 2xx")
+        return delay
 
 
 def managed_exe():
@@ -301,6 +310,7 @@ class Bench:
             self.core = Core(endpoint="http://"+address, secret=secret)
             self.base = {"external-controller": address, "secret": secret,
                          "mode": "rule", "allow-lan": False, "log-level": "silent",
+                         "unified-delay": False,
                          "tun": {"enable": False}, "rules": ["MATCH,DIRECT"]}
             path = Path(self.root.name) / "bench.json"
             path.write_text(json.dumps(self.base), encoding="utf-8")
@@ -438,6 +448,7 @@ def active_config(profiles, doc, settings, mixed, probe, token, *, geo, direct):
     dns_domains = [f"+.{host}" for host in domains]
     config = {
         "mode": settings["mode"], "allow-lan": False, "bind-address": "127.0.0.1",
+        "unified-delay": False,
         "mixed-port": mixed, "log-level": "warning", "profile": {"store-selected": False},
         "geodata-mode": False, "geo-auto-update": False,
         "tun": {"enable": False, "stack": "mixed", "auto-route": True, "strict-route": True,
@@ -546,6 +557,38 @@ class Ownership:
         core.select(ACTIVE, group)
         if self.mode == "global":
             core.select("GLOBAL", ACTIVE)
+
+    def probe_candidate(self, candidate, address):
+        if not self.core:
+            raise VPNError("VPN-X 会话尚未启动")
+        self.core.proxy_info(self.session_id or "")
+        group = self.group_keys.get((candidate.vendor.id, candidate.group))
+        if not group or candidate.node.key not in self.core.proxy_info(group).get("all", []):
+            raise VPNError("此节点尚未载入，重新启动代理后可使用")
+        # Test the named outbound with the running core's own dialer. The request never
+        # changes the selector and does not traverse a second process behind our TUN.
+        return self.core.delay(candidate.node.key, address)
+
+    def switch_loaded(self, current, candidate):
+        if not self.core:
+            raise VPNError("VPN-X 会话尚未启动")
+        self.core.proxy_info(self.session_id or "")
+        old_group = self.group_keys.get((current.vendor.id, current.group))
+        group = self.group_keys.get((candidate.vendor.id, candidate.group))
+        if not old_group or not group:
+            raise VPNError("此节点尚未载入，重新启动代理后可使用")
+        old = self.core.proxy_info(old_group)
+        target = old if group == old_group else self.core.proxy_info(group)
+        if candidate.node.key not in target.get("all", []):
+            raise VPNError("此节点尚未载入，重新启动代理后可使用")
+        if (self.core.proxy_info(ACTIVE).get("now") != old_group
+                or old.get("now") != current.node.key
+                or (self.mode == "global" and self.core.proxy_info("GLOBAL").get("now") != ACTIVE)):
+            raise VPNError("当前出口已在外部切换，请重新启动 VPN-X 会话")
+        if target.get("now") != candidate.node.key:
+            self.core.select(group, candidate.node.key)
+        if group != old_group:
+            self.core.select(ACTIVE, group)
 
     def enable(self):
         want_tun = self.network == "tun"

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+from collections import deque
 from datetime import datetime
 import hashlib
 import json
@@ -11,21 +12,22 @@ import re
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from threading import Lock
 import time
 import traceback
 
-from PySide6.QtCore import QObject, QLockFile, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QLockFile, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
     QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem,
-    QStackedWidget, QSystemTrayIcon, QVBoxLayout, QWidget,
+    QStackedWidget, QSystemTrayIcon, QTableView, QVBoxLayout, QWidget,
 )
 
 from app_info import APP_NAME, APP_VERSION
-from automation import DEFAULTS, Engine
+from automation import BACKUP_INTERVAL, DEFAULTS, HEALTH_INTERVAL, Engine
 from catalog import (
     CLOUDFLARE_CHECK, DEFAULT_CHECK, PUBLIC_SETTINGS, SOURCE_FILENAME,
     CatalogDownloadError, CatalogSource, VPNError, atomic, catalog_settings, check_page_password,
@@ -88,7 +90,7 @@ QTabBar::tab {
 QTabBar::tab:hover { background:#f4f6f4; }
 QTabBar::tab:selected { background:#eaf0eb; color:#202321; font-weight:650; }
 QTabBar::tab:focus { border-color:#94aa99; }
-QTableWidget {
+QTableWidget, QTableView {
     background:#fff; alternate-background-color:#fbfcfb; border:1px solid #e4e8e5;
     border-radius:14px; outline:0; selection-background-color:#e7efe8; selection-color:#202321;
 }
@@ -99,7 +101,7 @@ QHeaderView::section {
 }
 QHeaderView::section:first { border-top-left-radius:12px; }
 QHeaderView::section:last { border-top-right-radius:12px; }
-QTableWidget::item { border-bottom:1px solid #edf0ed; padding-left:9px; }
+QTableWidget::item, QTableView::item { border-bottom:1px solid #edf0ed; padding-left:9px; }
 QStatusBar { background:#fff; color:#575f59; border-top:1px solid #edf0ed; }
 QStatusBar::item { border:0; }
 QProgressBar { background:#e6ece8; border:0; border-radius:4px; }
@@ -273,16 +275,90 @@ class CatalogEditor(QWidget):
             if not path:
                 return
             atomic(path if path.lower().endswith(".vxp") else path+".vxp", data)
-            self.window.events.line.emit(f"已制作并保存加密目录（{len(rows)} 家厂商）")
+            self.window.events.line(f"已制作并保存加密目录（{len(rows)} 家厂商）")
             self.window.statusBar().showMessage("已导出加密目录", 5000)
         except (VPNError, OSError) as e:
             QMessageBox.warning(self, "无法导出", str(e) if isinstance(e, VPNError) else "无法写入文件")
             return
 
 
-class Events(QObject):
-    line = Signal(str)
-    progress = Signal(str, int, int)
+LOG_LIMIT = 3000
+
+
+class Events:
+    """Workers produce data; the GUI takes one batch on each timer tick."""
+    def __init__(self):
+        self.lock = Lock()
+        self.lines = deque(maxlen=LOG_LIMIT)
+        self.line_count = 0
+        self.shown_count = 0
+        self.latest_progress = None
+
+    def line(self, line):
+        clean = re.sub(r"(?i)https?://[^\s，；]+", "[链接]", str(line))
+        clean = " ".join(clean.splitlines())[:1024]
+        with self.lock:
+            self.lines.append(f"{datetime.now():%H:%M:%S}  {clean}")
+            self.line_count += 1
+
+    def progress(self, *values):
+        with self.lock:
+            self.latest_progress = values
+
+    def take(self, *, logs):
+        with self.lock:
+            progress, self.latest_progress = self.latest_progress, None
+            lines = None
+            if logs and self.shown_count != self.line_count:
+                count = min(self.line_count - self.shown_count, len(self.lines))
+                lines = tuple(self.lines)[-count:]
+                self.shown_count = self.line_count
+        return progress, lines
+
+
+class NodeTable(QAbstractTableModel):
+    headers = ("节点", "厂商 / 代理组", "剩余流量", "连接延迟", "连接")
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.candidates = []
+        self.current = None
+        self.backups = set()
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.candidates)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.headers)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return self.headers[section]
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or role not in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole):
+            return None
+        c = self.candidates[index.row()]
+        column = index.column()
+        if column == 0:
+            return c.node.name
+        if column == 1:
+            return f"{c.vendor.name} / {c.group}"
+        if column == 2:
+            return f"{c.quota/2**30:.2f} GiB" if c.quota is not None else "未知"
+        if column == 3:
+            return f"{c.delay} ms" if c.delay is not None else "—"
+        if self.current and c.identity == self.current.identity:
+            return "使用中" if self.current.verified else "使用中 · 未测试"
+        return "备用" if c.identity in self.backups else "其他"
+
+    def replace(self, candidates, current, backups):
+        self.beginResetModel()
+        self.candidates, self.current, self.backups = candidates, current, backups
+        self.endResetModel()
+
+    def candidate(self, row):
+        return self.candidates[row] if row is not None and 0 <= row < len(self.candidates) else None
 
 
 class EndpointChoice(QWidget):
@@ -329,16 +405,18 @@ class Window(QMainWindow):
         self.next_update = 0
         self.pending_update = None
         self.update_prompt = False
+        self.subscription_prompt = None
+        self.prompted_subscription_revision = 0
         self.exit_action = None
         self.tray = None
         self.events = Events()
-        self.events.line.connect(self.write_log)
-        self.events.progress.connect(self.show_progress)
-        self.engine = Engine(self.events.line.emit, self.events.progress.emit, data_dir=data_dir)
+        self.engine = Engine(self.events.line, self.events.progress, data_dir=data_dir)
         self.job = None
         self.next_sync = 0
+        self.next_health = None
+        self.next_backups = None
+        self.monitored = None
         self.fields = {}
-        self.table_results = {}
         self.page_hash = ""
         self.settings_loading = False
         self.save_timer = QTimer(self)
@@ -346,6 +424,10 @@ class Window(QMainWindow):
         self.save_timer.setInterval(450)
         self.save_timer.timeout.connect(self.persist_edits)
         self.build()
+        self.events_timer = QTimer(self)
+        self.events_timer.setInterval(200)
+        self.events_timer.timeout.connect(self.flush_events)
+        self.events_timer.start()
         self.load_catalog_source()
         self.load_settings()
         self.timer = QTimer(self)
@@ -390,7 +472,8 @@ class Window(QMainWindow):
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setPlaceholderText("执行步骤将在这里显示。")
-        self.log_view.setMaximumBlockCount(70000)
+        self.log_view.setMaximumBlockCount(LOG_LIMIT)
+        self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.log_view.setFixedHeight(158)
         self.log_view.hide()
         layout.addWidget(self.log_view)
@@ -427,8 +510,8 @@ class Window(QMainWindow):
         row = QHBoxLayout()
         row.setContentsMargins(0, 5, 0, 0)
         self.auto_button = button("一键启动", lambda: self.with_settings("一键启动", self.engine.auto), True)
-        self.stop_button = button("关闭", lambda: self.run_job("关闭代理", self.engine.close))
-        self.bad_button = button("这个节点不可用", lambda: self.run_job("切换下一节点", self.engine.next_node))
+        self.stop_button = button("关闭", self.request_stop)
+        self.bad_button = button("切换为备用节点", lambda: self.run_job("切换为备用节点", self.engine.switch_backup))
         self.restart_button = button("重启", lambda: self.with_settings("重启代理", self.engine.restart), True)
         self.cancel_button = button("取消操作", self.cancel_job)
         for b in (self.auto_button, self.stop_button, self.bad_button, self.restart_button):
@@ -452,8 +535,9 @@ class Window(QMainWindow):
         switch.addWidget(banner("代理组", "muted"))
         switch.addWidget(self.group, 1)
         layout.addLayout(switch)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["节点", "厂商 / 代理组", "剩余流量", "连接延迟", "连接"])
+        self.table = QTableView()
+        self.node_table = NodeTable(self.table)
+        self.table.setModel(self.node_table)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -463,8 +547,8 @@ class Window(QMainWindow):
         self.table.verticalHeader().hide()
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.node_menu)
-        self.table.cellDoubleClicked.connect(lambda *_: self.manual_use())
-        self.table.setToolTip("双击节点可启用，右键可测试连接或启用所选代理组")
+        self.table.doubleClicked.connect(lambda index: self.manual_use(index.row()))
+        self.table.setToolTip("双击节点，连接测试通过后切换")
         self.empty_nodes = banner("暂无节点记录", "muted")
         self.empty_nodes.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         empty_layout = QVBoxLayout(self.table.viewport())
@@ -472,7 +556,8 @@ class Window(QMainWindow):
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for i in range(2, self.table.columnCount()):
+        header.setResizeContentsPrecision(0)
+        for i in range(2, self.node_table.columnCount()):
             header.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.table, 1)
         self.set_controls(False)
@@ -614,14 +699,24 @@ class Window(QMainWindow):
             return
         self.statusBar().showMessage("进入密码已修改", 5000)
 
-    def write_log(self, line):
-        # Defensively redact links even if a node or vendor chose a URL as its name.
-        clean = re.sub(r"(?i)https?://[^\s，；]+", "[链接]", str(line))
-        self.log_view.appendPlainText(f"{datetime.now():%H:%M:%S}  {clean}")
+    @Slot()
+    def flush_events(self):
+        progress, lines = self.events.take(logs=self.log_view.isVisible())
+        if progress:
+            self.show_progress(*progress)
+        if lines is not None:
+            scrollbar = self.log_view.verticalScrollBar()
+            previous = scrollbar.value()
+            at_bottom = previous == scrollbar.maximum()
+            self.log_view.appendPlainText("\n".join(lines))
+            if not at_bottom:
+                scrollbar.setValue(previous)
 
     def toggle_log(self):
         show = self.log_view.isHidden()
         self.log_view.setVisible(show)
+        if show:
+            self.flush_events()
         self.log_button.setText("隐藏日志" if show else "显示日志")
 
     def load_catalog_source(self):
@@ -633,7 +728,7 @@ class Window(QMainWindow):
             self.source_error = f"{SOURCE_FILENAME} 无法使用：{reason}。请在「高级模式」检查目录来源。"
             self.warning.setText(self.source_error)
             self.warning.show()
-            self.events.line.emit(self.source_error)
+            self.events.line(self.source_error)
         self.catalog_editor.show_source(self.catalog_source)
         if not self.source_error and not self.catalog_source.configured:
             self.detail.setText("请先在「高级模式」填写或导入目录来源。")
@@ -654,7 +749,7 @@ class Window(QMainWindow):
             self.detail.setText("目录来源已保存，可一键启动。" if source.configured else
                                 "请先在「高级模式」填写或导入目录来源。")
         self.statusBar().showMessage("目录来源已保存", 5000)
-        self.events.line.emit("已保存目录来源")
+        self.events.line("已保存目录来源")
 
     def load_settings(self):
         data = dict(DEFAULTS, **self.catalog_source.settings())
@@ -676,7 +771,7 @@ class Window(QMainWindow):
                 if saved.get("update_source_id") == self.update_source_id():
                     self.next_update = float(saved.get("next_update", 0))
             except Exception:
-                self.events.line.emit("部分设置无法读取，已使用默认值")
+                self.events.line("部分设置无法读取，已使用默认值")
         self.apply_fields(data)
         self.saved = data
 
@@ -761,28 +856,52 @@ class Window(QMainWindow):
             self.tick()
 
     def tick(self):
-        if self.job or self.source_error or self.update_prompt:
+        if self.job or self.update_prompt or self.exit_action or self.subscription_prompt is not None:
             return
-        if self.install_root and self.catalog_source.update_url and time.time() >= self.next_update:
+        now = time.monotonic()
+        if self.engine.current and self.next_health is not None and now >= self.next_health:
+            self.next_health = now + HEALTH_INTERVAL
+            self.run_job("后台检测当前节点", self.engine.check_health, silent=True)
+        elif self.engine.current and self.next_backups is not None and now >= self.next_backups:
+            self.next_backups = now + BACKUP_INTERVAL
+            self.run_job("后台检查备用节点", self.engine.refresh_backups, silent=True)
+        elif self.source_error:
+            return
+        elif self.install_root and self.catalog_source.update_url and time.time() >= self.next_update:
             self.check_updates()
         elif self.catalog_source.configured and time.time() >= self.next_sync:
-            self.run_job("定时更新订阅", lambda: self.engine.refresh(self.saved))
+            data = self.saved.copy()
+            self.run_job("定时更新订阅", lambda: self.engine.refresh(data, background=True), silent=True)
+
+    def schedule_health_checks(self):
+        current = self.engine.current
+        if not current:
+            self.monitored = self.next_health = self.next_backups = None
+        elif current is not self.monitored:
+            old = self.monitored
+            self.monitored = current
+            now = time.monotonic()
+            self.next_health = now + HEALTH_INTERVAL
+            if old is None:
+                self.next_backups = now + BACKUP_INTERVAL
 
     def set_controls(self, busy):
         active = bool(self.engine.current)
         recovery = self.engine.own.journal.exists()
         self.auto_button.setVisible(not active)
         self.stop_button.setVisible(active or recovery)
-        self.bad_button.setVisible(active and self.engine.current.verified)
+        self.bad_button.setVisible(active)
         self.restart_button.setVisible(active)
-        self.bad_button.setEnabled(not busy)
+        self.bad_button.setEnabled(not busy and bool(self.engine.available_backups()))
         cancellable = busy and self.job_title in (
-            "一键启动", "定时更新订阅", "连接测试", "切换下一节点", "重启代理",
+            "一键启动", "连接测试", "切换为备用节点", "重启代理", "测试并切换节点",
             "从本地目录启动", "应用所选代理")
         self.cancel_button.setVisible(cancellable)
         self.cancel_button.setEnabled(cancellable)
         for item in (self.auto_button, self.stop_button, self.restart_button):
             item.setEnabled(not busy)
+        if busy and self.silent_job:
+            self.stop_button.setEnabled(self.exit_action is None)
         if hasattr(self, "update_button"):
             self.update_button.setEnabled(not busy)
         for item in (self.vendor, self.group):
@@ -791,26 +910,30 @@ class Window(QMainWindow):
             if hasattr(self, name):
                 getattr(self, name).setEnabled(not busy)
 
-    def run_job(self, title, fn):
+    def run_job(self, title, fn, *, silent=False):
         if self.job:
             return
         self.job_title = title
+        self.silent_job = silent
+        self.events.take(logs=False)
         self.engine.cancel.clear()
         self.old_sync = self.engine.last_sync
         self.job_error = None
-        self.events.line.emit(f"{title} · 开始")
-        self.detail.setText(f"{title}进行中… 可展开日志查看进度")
+        self.events.line(f"{title} · 开始")
+        if not silent:
+            self.detail.setText(f"{title}进行中… 可展开日志查看进度")
         self.job = Job(fn, self)
         self.job.result.connect(self.set_error)
         self.job.finished.connect(self.finished)
         self.progress_timer.stop()
-        self.show_progress(f"{title}进行中", 0, 0)
+        if not silent:
+            self.show_progress(f"{title}进行中", 0, 0)
         self.set_controls(True)
         self.job.start()
 
     @Slot(str, int, int)
     def show_progress(self, stage, completed, total):
-        if not self.job:
+        if not self.job or self.silent_job:
             return
         self.progress_bar.setRange(0, total)
         if total:
@@ -823,7 +946,7 @@ class Window(QMainWindow):
         self.cancel_button.setEnabled(False)
         self.detail.setText("正在取消，等待已发出的网络请求结束…")
         self.show_progress("正在取消，等待网络请求结束", 0, 0)
-        self.events.line.emit("已请求取消当前操作")
+        self.events.line("已请求取消当前操作")
 
     @Slot(object)
     def set_error(self, error):
@@ -835,7 +958,7 @@ class Window(QMainWindow):
         self.job.deleteLater()
         self.job = None
         error = self.job_error
-        if error:
+        if error or self.silent_job:
             self.progress_panel.hide()
         else:
             self.progress_bar.setRange(0, 1)
@@ -847,7 +970,7 @@ class Window(QMainWindow):
         if imported:
             self.saved = dict(self.saved, **imported)
             self.apply_fields(self.saved)
-            self.events.line.emit("已应用加密目录中的软件配置")
+            self.events.line("已应用加密目录中的软件配置")
         if self.engine.last_sync != self.old_sync:
             self.next_sync = time.time() + 3600*self.saved["hours"]
         elif self.job_title == "定时更新订阅":
@@ -855,31 +978,36 @@ class Window(QMainWindow):
         try:
             self.save_settings(self.saved)
         except OSError:
-            self.events.line.emit("无法保存任务时间")
+            self.events.line("无法保存任务时间")
+        self.schedule_health_checks()
         self.fill_profiles()
         self.set_controls(False)
-        self.events.line.emit(f"{self.job_title} · " + (f"失败：{error}" if error else "完成"))
+        self.events.line(f"{self.job_title} · " + (f"失败：{error}" if error else "完成"))
         current = self.engine.current
         if current:
-            self.status.setText(f"代理运行中 · {current.node.name}")
-            summary = f"剩余候选 {len(self.engine.queue)} 个" if current.verified else "手动启用 · 未测试"
+            status = "当前节点不可用，等待备用" if self.engine.health_failures >= 2 else "代理运行中"
+            self.status.setText(f"{status} · {current.node.name}")
+            summary = f"可用备用节点 {len(self.engine.available_backups())} 个"
+            if self.engine.pending_profiles is not None:
+                summary += " · 已缓存新订阅，重启代理后使用"
             self.detail.setText(f"{current.vendor.name}  /  {current.group}　•　{summary}")
         elif self.engine.own.journal.exists():
             self.status.setText("需要恢复代理设置")
             self.detail.setText("点击关闭以重试；详细信息见日志。")
-        else:
+        elif not self.silent_job:
             self.status.setText("代理尚未启动")
             self.detail.setText(f"{self.job_title}已完成" if not error else "可展开日志查看执行过程")
         warnings = [self.source_error] if self.source_error else []
-        if error:
+        if error and not self.silent_job:
             warnings.append(error)
-        if self.engine.failures:
+        if self.engine.failures and not self.silent_job:
             names = "、".join(self.engine.failures[:5])
             more = f" 等 {len(self.engine.failures)} 项" if len(self.engine.failures) > 5 else ""
             warnings.append(f"更新或选组失败：{names}{more}")
         self.warning.setText("　".join(warnings))
         self.warning.setVisible(bool(warnings))
-        self.statusBar().showMessage(f"{self.job_title}失败：{error}" if error else f"{self.job_title}完成", 10000)
+        if not self.silent_job:
+            self.statusBar().showMessage(f"{self.job_title}失败：{error}" if error else f"{self.job_title}完成", 10000)
         if self.exit_action:
             action, self.exit_action = self.exit_action, None
             if self.job_title == "关闭代理并退出" and error:
@@ -889,8 +1017,37 @@ class Window(QMainWindow):
                 QTimer.singleShot(0, lambda: self.finish_exit(action))
         elif self.job_title == "检查软件更新":
             QTimer.singleShot(0, lambda: self.update_finished(error))
+        elif self.job_title == "定时更新订阅" and not error:
+            QTimer.singleShot(0, self.offer_subscription_restart)
         elif fallback:
             QTimer.singleShot(0, self.import_catalog)
+
+    def offer_subscription_restart(self):
+        revision = self.engine.pending_revision
+        if (not self.engine.current or self.engine.pending_profiles is None or self.job or self.exit_action
+                or self.subscription_prompt is not None or revision == self.prompted_subscription_revision):
+            return
+        self.prompted_subscription_revision = revision
+        prompt = QMessageBox(self)
+        self.subscription_prompt = prompt
+        prompt.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        prompt.setWindowTitle("订阅更新已下载")
+        prompt.setText("订阅、节点或配置有变化。是否现在重启代理并应用已下载的内容？")
+        prompt.setInformativeText("重启会短暂中断连接。选择稍后会继续使用当前代理，可在主页点击「重启」应用。")
+        apply_now = prompt.addButton("现在重启", QMessageBox.ButtonRole.AcceptRole)
+        later = prompt.addButton("稍后", QMessageBox.ButtonRole.RejectRole)
+        prompt.setDefaultButton(later)
+        prompt.setEscapeButton(later)
+
+        def decided(_):
+            self.subscription_prompt = None
+            if (prompt.clickedButton() is apply_now and self.engine.pending_profiles is not None
+                    and self.engine.current and revision == self.engine.pending_revision):
+                self.with_settings("应用已下载的订阅", self.engine.apply_pending, require_source=False)
+
+        prompt.finished.connect(decided)
+        self.show_window()
+        prompt.open()
 
     def fill_profiles(self):
         selected = self.vendor.currentData()
@@ -921,35 +1078,31 @@ class Window(QMainWindow):
     def fill_table(self, *_):
         if self.job:
             return
+        selected_rows = self.table.selectionModel().selectedRows()
+        selected = self.node_table.candidate(selected_rows[0].row()) if selected_rows else None
         chosen = self.choice()
-        from automation import Candidate
-        if not chosen:
-            candidates = self.engine.results
-        else:
-            p = next((p for p in self.engine.profiles if p.vendor.id == chosen[0]), None)
-            best = [c for c in self.engine.results if c.vendor.id == chosen[0] and c.group == chosen[1]]
-            used = {c.node.key for c in best}
-            candidates = best + [Candidate(p.vendor, chosen[1], n, p.quota)
-                                 for n in p.groups[chosen[1]] if n.key not in used] if p else []
-        self.table.setUpdatesEnabled(False)
-        self.table.clearContents()
-        self.table.setRowCount(len(candidates))
-        self.empty_nodes.setVisible(not candidates)
-        self.table_results = dict(enumerate(candidates))
         current = self.engine.current
-        for row, c in enumerate(candidates):
-            selected = current and current.node.key == c.node.key and current.group == c.group
-            status = ("使用中" if current.verified else "使用中 · 未测试") if selected else ""
-            vals = (c.node.name, f"{c.vendor.name} / {c.group}",
-                    f"{c.quota/2**30:.2f} GiB" if c.quota is not None else "未知",
-                    f"{c.delay} ms" if c.delay is not None else "—",
-                    status)
-            for col, value in enumerate(vals):
-                item = QTableWidgetItem(value)
-                item.setToolTip(value)
-                self.table.setItem(row, col, item)
-        self.table.clearSelection()
-        self.table.setUpdatesEnabled(True)
+        backups = {c.identity: c for c in self.engine.available_backups()}
+        all_nodes = {c.identity: c for c in self.engine.list_candidates(self.engine.profiles)}
+        entries = {c.identity: c for c in self.engine.results if c.identity in all_nodes}
+        for identity, c in all_nodes.items():
+            entries.setdefault(identity, c)
+        entries.update(backups)
+        if current:
+            entries[current.identity] = current
+        candidates = [c for c in entries.values() if not chosen or c.identity[:2] == chosen]
+        candidates.sort(key=lambda c: 0 if current and c.identity == current.identity else
+                        1 if c.identity in backups else 2)
+        self.empty_nodes.setVisible(not candidates)
+        scroll = self.table.verticalScrollBar()
+        offset = scroll.value()
+        self.node_table.replace(candidates, current, set(backups))
+        if selected:
+            for row, c in enumerate(candidates):
+                if c.identity == selected.identity:
+                    self.table.selectRow(row)
+                    break
+        scroll.setValue(offset)
 
     def choice(self):
         vendor, group = self.vendor.currentData(), self.group.currentData()
@@ -972,12 +1125,16 @@ class Window(QMainWindow):
         menu.addAction("使用所选组 / 节点", self.manual_use)
         menu.exec(self.table.viewport().mapToGlobal(position))
 
-    def manual_use(self):
+    def manual_use(self, row=None):
         indexes = self.table.selectionModel().selectedRows()
-        candidate = self.table_results.get(indexes[0].row()) if indexes else None
-        choice = (candidate.vendor.id, candidate.group) if candidate else self.choice()
-        node = candidate.node.key if candidate else None
-        self.with_settings("应用所选代理", lambda s: self.engine.activate(s, choice, node), require_source=False)
+        if row is None or isinstance(row, bool):
+            row = indexes[0].row() if indexes else None
+        candidate = self.node_table.candidate(row)
+        if candidate:
+            self.with_settings("测试并切换节点", lambda s: self.engine.test_and_use(s, candidate), require_source=False)
+        else:
+            choice = self.choice()
+            self.with_settings("应用所选代理", lambda s: self.engine.activate(s, choice), require_source=False)
 
     def import_catalog(self):
         path, _ = QFileDialog.getOpenFileName(self, "下载失败，请导入本地加密目录", "",
@@ -1007,19 +1164,25 @@ class Window(QMainWindow):
     def request_exit(self):
         self.finish_exit("quit")
 
+    def request_stop(self):
+        self.finish_exit("stop")
+
     def finish_exit(self, action):
         if self.job:
             self.exit_action = action
+            self.stop_button.setEnabled(False)
             self.cancel_job()
+            return
+        if action == "stop":
+            self.run_job("关闭代理", self.engine.close)
             return
         if self.save_timer.isActive():
             self.save_timer.stop()
             self.persist_edits()
-        if self.engine.own.journal.exists():
+        if self.engine.own.journal.exists() or self.engine.own.headless:
             self.exit_action = action
-            self.run_job("关闭代理并退出", self.engine.close)
+            self.run_job("关闭代理并退出", self.engine.shutdown)
             return
-        self.engine.own.stop_headless()
         if action == "update":
             try:
                 subprocess.Popen([sys.executable, "--apply-update", str(os.getpid())],
@@ -1056,7 +1219,7 @@ class Window(QMainWindow):
         self.update_manual = manual
         self.update_prompt = True
         def run():
-            self.pending_update = updates.check(self.install_root, address, self.events.progress.emit,
+            self.pending_update = updates.check(self.install_root, address, self.events.progress,
                                                 self.engine.cancelled)
         self.run_job("检查软件更新", run)
 
