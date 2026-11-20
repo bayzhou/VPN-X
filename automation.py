@@ -7,7 +7,7 @@ import time
 
 from catalog import (
     CatalogSource, PUBLIC_SETTINGS, CatalogDownloadError, VPNError, atomic,
-    decode_catalog, fetch_profile,
+    decode_catalog_details, fetch_profile,
     region_rank, request_data, url,
 )
 from verge import Bench, DATA, Ownership, ensure_verge, find_verge
@@ -62,6 +62,7 @@ class Engine:
         self.own = Ownership(log, data_dir=data_dir)
         self.catalog = None
         self.imported_settings = {}
+        self.imported_ai = None
         self.profiles = []
         self.profile_catalog = None
         self.complete_profiles = None
@@ -97,6 +98,7 @@ class Engine:
 
     def sync(self, settings, path=None, *, stale=False):
         self.imported_settings = {}
+        self.imported_ai = None
         source = CatalogSource(settings["catalog"], settings["password"])
         if not source.configured:
             raise VPNError("请在「高级模式」中设置 VXP 链接和密钥")
@@ -120,7 +122,7 @@ class Engine:
                     raise CatalogDownloadError(str(e)) from None
             self.progress("校验并解密目录", 0, 0)
             self.log("校验完整性并解密订阅目录")
-            result, imported = decode_catalog(payload, source.key)
+            result, imported, ai_key, ai_model = decode_catalog_details(payload, source.key)
         except (OSError, VPNError) as e:
             self.cancelled()
             reason = str(e) if isinstance(e, VPNError) else "无法读取目录文件"
@@ -131,12 +133,13 @@ class Engine:
             self.log(f"远程目录更新失败：{reason}；尝试使用上次缓存")
             self.failures.append("目录更新失败，使用上次缓存")
             self.progress("读取上次缓存", 0, 0)
-            result, _ = decode_catalog(cache.read_bytes(), source.key)
+            result, _, ai_key, ai_model = decode_catalog_details(cache.read_bytes(), source.key)
         else:
             atomic(cache, payload)
             self.imported_settings = imported
             self.last_sync = time.time()
         self.catalog = result
+        self.imported_ai = ai_key, ai_model
         self.log(f"目录已就绪：{len(result)} 家厂商")
 
     def refresh(self, settings, path=None, *, stale=False, background=False):
@@ -544,7 +547,7 @@ class Engine:
 
     def available_backups(self, now=None):
         now = time.monotonic() if now is None else now
-        candidates = [candidate for candidate, checked_at in self.backups.values()
+        candidates = [candidate for candidate, checked_at in self.backups.copy().values()
                       if now - checked_at <= BACKUP_LIFETIME]
         return sorted(candidates, key=lambda c: c.backup_sort_key(preferred_regions(self.settings or DEFAULTS)))
 

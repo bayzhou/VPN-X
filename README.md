@@ -1,4 +1,4 @@
-# VPN-X V1.4 · Windows 自动代理
+# VPN-X V1.5 · Windows 自动代理
 
 VPN-X 是一款面向 Windows 10/11 的 Clash Verge Rev 自动代理工具。它适合有多个 VPN
 厂商订阅、希望按偏好自动选择节点的人，也适合由一人维护目录、让多台电脑使用同一份
@@ -15,7 +15,7 @@ VPN-X 是一款面向 Windows 10/11 的 Clash Verge Rev 自动代理工具。它
 - **制作可分发的目录。** 在受密码保护的高级模式中，可以维护 VXP 链接和密钥，
   编辑厂商列表，并把当前软件配置和订阅一起导出为加密 VXP。
 
-运行 `VPN-X-V1.4-Setup.exe` 安装，再从开始菜单打开 VPN-X，按提示授予管理员权限。
+运行 `VPN-X-V1.5-Setup.exe` 安装，再从开始菜单打开 VPN-X，按提示授予管理员权限。
 安装包已包含 Clash Verge Rev、Mihomo 和 7-Zip。用户设置和目录来源保存在
 `%LOCALAPPDATA%\VPN-X`，软件更新不会覆盖已有配置值。启动时，安装包中的默认来源会补齐本机未设置的 VXP 来源和更新地址。从旧版便携包迁移时，可通过高级模式导入原来的 `catalog-source.json`。
 
@@ -60,15 +60,18 @@ VPN-X 是一款面向 Windows 10/11 的 Clash Verge Rev 自动代理工具。它
 - 后台每 5 分钟检测当前节点，一次失败再试一次；连续两个周期均失败才尝试切换。
   每 10 分钟先在当前厂商和下一优先厂商的首选地区随机抽测，每家每个地区最多测 3 个、每家保留最多 2 个备用。
   不足 2 个时按地区优先级扩大到其他厂商。探测不修改代理选择；真正切换时，已有连接仍可能需要重连。
-- 状态栏「显示日志」默认收起。日志最多保留最近 3000 条，展开可看到已完成及正在执行的步骤、
+- 左侧「运行日志」单独显示最近 3000 条记录，包括已完成及正在执行的步骤、
   订阅错误、连接延迟、排序、逐节点验证和恢复过程。日志不会显示订阅链接或密钥。
 - 启动时，同一地区的节点最多同时测试 12 个；补测备用时最多同时测试 4 个。实际切换出口仍逐个验证。
 - 关闭窗口会收进系统托盘，代理与定时任务继续运行。要真正退出，请在托盘菜单选「关闭代理并退出」。
   强制结束进程或断电可能留下指向本地端口的 Windows 系统代理设置；再次启动 VPN-X 会尝试恢复上次会话。
-- 「设置 → 检查更新」可以手动检查。配置了可信更新源时，程序运行期间每 24 小时自动检查并下载新版本。
+- 「代理设置 → 检查更新」可以手动检查。配置了可信更新源时，程序运行期间每 24 小时自动检查并下载新版本。
   下载失败可重试；下载完成可立即更新或稍后处理。稍后选择不会安装，下次手动检查或次日自动检查时会再次提示。
   更新先验证签名、文件大小与 SHA-256，再使用内置 7-Zip 解压到独立目录。新版通过自检并启动后，
   才切换开始菜单的启动目标。旧版和用户设置保留。
+
+- 左侧 Ask AI 打开 VPN-X AI 和本地使用指南。指南显示精简的实时状态，常见问题可离线回答。
+  需要联网分析时，软件才发送问题、相关指南、精简状态和最近一轮对话给 DeepSeek。聊天每天最多 100 次，按本机日期刷新。
 
 VPN-X 通常直接以管理员权限启动 Clash Verge 自带的 Mihomo 内核，
 后台启动失败时会打开 Clash Verge 窗口。厂商订阅由 VPN-X 管理，代理组和选中节点会载入内核。
@@ -104,14 +107,14 @@ python -m pip install -r requirements.txt pyinstaller
 .\build.ps1 -OutputDirectory 'dist' -Installer 'C:\路径\Clash.Verge_2.5.10_x64-setup.exe' -SevenZip 'C:\Program Files\7-Zip\7z.exe' -ISCC 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' -ChineseMessages 'C:\路径\ChineseSimplified.isl' -CatalogSource 'C:\路径\catalog-source.json'
 ```
 
-构建生成首次安装所需的 `VPN-X-V1.4-Setup.exe`。配置更新公钥后可生成 `VPN-X-V1.4-Update.zip`。
+构建生成首次安装所需的 `VPN-X-V1.5-Setup.exe`。配置更新公钥后可生成 `VPN-X-V1.5-Update.zip`。
 安装包包含 7-Zip 命令行程序和许可，7-Zip 源码见 [官方仓库](https://github.com/ip7z/7zip)。
 更新 ZIP 不带用户来源文件。要启用自建更新源，先生成 Ed25519 密钥对。私钥应单独保管，只将公钥内置到安装包：
 
 ```powershell
 python sign_update.py keygen 'C:\签名\vpn-x-signing.pem' 'C:\签名\update-public-key.bin'
 # 构建时加 -UpdatePublicKey 'C:\签名\update-public-key.bin' -UpdateUrl 'https://updates.example.com/vpn-x.json'
-python sign_update.py sign 'C:\签名\vpn-x-signing.pem' 'dist\VPN-X-V1.4-Update.zip' 'https://updates.example.com/VPN-X-V1.4-Update.zip' 'dist\vpn-x.json'
+python sign_update.py sign 'C:\签名\vpn-x-signing.pem' 'dist\VPN-X-V1.5-Update.zip' 'https://updates.example.com/VPN-X-V1.5-Update.zip' 'dist\vpn-x.json'
 ```
 
 先上传 ZIP，再发布清单。后续版本继续使用同一把签名密钥；如果未内置公钥，安装包可以正常安装运行，

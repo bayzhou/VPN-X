@@ -89,7 +89,7 @@ try {
         $OutputDirectory = if ($MaskCatalogSource) { 'dist\masked' } else { 'dist\unmasked' }
     }
     $outputRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDirectory)
-    $logo = (Get-Item -LiteralPath 'logo.ico').FullName
+    $sourceLogo = (Get-Item -LiteralPath 'logo.ico').FullName
     if ($MaskCatalogSource -and $CatalogSource) {
         throw 'Use either -MaskCatalogSource or -CatalogSource.'
     }
@@ -106,6 +106,8 @@ try {
     $versionTuple = $appVersion.Replace('.', ',') + ',0,0'
     $exeName = 'VPN-X.exe'
     $versionResource = [IO.Path]::GetTempFileName()
+    $iconDirectory = Join-Path ([IO.Path]::GetTempPath()) ('vpn-x-icon-' + [Guid]::NewGuid().ToString('N'))
+    $logo = Join-Path $iconDirectory 'logo.ico'
     $versionInfo = @"
 VSVersionInfo(
   ffi=FixedFileInfo(filevers=($versionTuple), prodvers=($versionTuple), mask=0x3f, flags=0,
@@ -121,7 +123,7 @@ VSVersionInfo(
 "@
     $buildArgs = @('--noconfirm', '--clean', '--onedir', '--windowed',
                    '--name', 'VPN-X', '--distpath', (Join-Path $outputRoot 'payload'), '--version-file', $versionResource,
-                   '--icon', $logo, '--add-data', "$logo;.",
+                   '--icon', $logo, '--add-data', "$logo;.", '--add-data', 'vpnx-guide.md;.',
                    '--add-data', "$destination;installers")
     if ($UpdatePublicKey) {
         if ((Split-Path -Leaf $UpdatePublicKey) -ne 'update-public-key.bin') { throw 'Name the raw public key update-public-key.bin.' }
@@ -130,6 +132,9 @@ VSVersionInfo(
     $buildArgs += 'vpn_x.py'
     $previousPath = $env:Path
     try {
+        $null = New-Item -ItemType Directory -Path $iconDirectory
+        & $pythonExe -c 'import sys; from ui_icons import write_application_icon; write_application_icon(*sys.argv[1:])' $sourceLogo $logo
+        if ($LASTEXITCODE) { throw 'Could not prepare the VPN-X application icon.' }
         [IO.File]::WriteAllText($versionResource, $versionInfo)
         # An unrelated ICU on PATH can shadow Windows ICU during DLL collection.
         $env:Path = "$env:SystemRoot\System32;$env:SystemRoot;$(Split-Path -Parent $pythonExe)"
@@ -213,6 +218,8 @@ print(target)
     finally {
         $env:Path = $previousPath
         Remove-Item -LiteralPath $versionResource -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $logo -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $iconDirectory -ErrorAction SilentlyContinue
     }
 }
 finally {

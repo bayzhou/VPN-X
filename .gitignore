@@ -12,5 +12,7 @@ installers/*.exe
 /clash/
 /bench-*/
 /updates/
+/ai-key.json.dpapi
+/ai-usage.json
 *.pem
 update-public-key.bin

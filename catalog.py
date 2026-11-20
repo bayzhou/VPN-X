@@ -25,6 +25,7 @@ MAX_DOWNLOAD = 8 * 1024 * 1024
 DEFAULT_CHECK = "https://chatgpt.com/robots.txt"
 CLOUDFLARE_CHECK = "https://cp.cloudflare.com/generate_204"
 SOURCE_FILENAME = "catalog-source.json"
+DEFAULT_AI_MODEL = "deepseek-flash"
 PUBLIC_SETTINGS = dict(check=DEFAULT_CHECK, hours=24, regions="", network="tun", mode="rule")
 
 
@@ -246,18 +247,34 @@ def _key(password, salt):
     return Scrypt(salt=salt, length=32, n=2**17, r=8, p=1).derive(password.encode("utf-8"))
 
 
-def encrypt(rows, password, settings=None):
+def validate_ai_key(value):
+    if not isinstance(value, str) or (value and not re.fullmatch(r"[!-~]{8,512}", value)):
+        raise VPNError("DeepSeek API Key 格式不正确")
+    return value
+
+
+def validate_ai_model(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", value):
+        raise VPNError("DeepSeek 模型 ID 格式不正确")
+    return value
+
+
+def encrypt(rows, password, settings=None, *, ai_key=None, ai_model=None):
     if len(password) < 12:
         raise VPNError("制作文件时请使用至少 12 个字符的密钥")
     values = [{k: val for k, val in asdict(v).items() if val is not None} for v in vendors(rows)]
-    if settings is not None:
-        values = {"vendors": values, "settings": catalog_settings(settings)}
+    if settings is not None or ai_key is not None or ai_model is not None:
+        values = {"vendors": values, "settings": catalog_settings(settings if settings is not None else {})}
+        if ai_key is not None:
+            values["ai_key"] = validate_ai_key(ai_key)
+        if ai_model is not None:
+            values["ai_model"] = validate_ai_model(ai_model)
     salt, nonce = secrets.token_bytes(16), secrets.token_bytes(12)
     payload = json.dumps(values, ensure_ascii=False).encode("utf-8")
     return MAGIC + salt + nonce + AESGCM(_key(password, salt)).encrypt(nonce, payload, MAGIC)
 
 
-def decode_catalog(data, password):
+def decode_catalog_details(data, password):
     start = len(MAGIC)
     if not data.startswith(MAGIC) or not start + 44 <= len(data) <= 1024 * 1024:
         raise VPNError("不是有效的 VPN-X v1 加密目录")
@@ -268,10 +285,16 @@ def decode_catalog(data, password):
     except (InvalidTag, ValueError, UnicodeError):
         raise VPNError("解密失败：密钥不正确或文件已损坏") from None
     if isinstance(value, list):
-        return vendors(value), {}
-    if isinstance(value, dict) and value.keys() == {"vendors", "settings"}:
-        return vendors(value["vendors"]), catalog_settings(value["settings"])
+        return vendors(value), {}, "", DEFAULT_AI_MODEL
+    if isinstance(value, dict) and {"vendors", "settings"} <= value.keys() <= {"vendors", "settings", "ai_key", "ai_model"}:
+        return (vendors(value["vendors"]), catalog_settings(value["settings"]), validate_ai_key(value.get("ai_key", "")),
+                validate_ai_model(value.get("ai_model", DEFAULT_AI_MODEL)))
     raise VPNError("加密目录的内容格式无效")
+
+
+def decode_catalog(data, password):
+    rows, settings, _, _ = decode_catalog_details(data, password)
+    return rows, settings
 
 
 def decrypt(data, password):

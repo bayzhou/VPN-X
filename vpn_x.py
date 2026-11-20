@@ -16,20 +16,25 @@ from threading import Lock
 import time
 import traceback
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QLockFile, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QLockFile, QSize, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
-    QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem,
-    QStackedWidget, QSystemTrayIcon, QTableView, QVBoxLayout, QWidget,
+    QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+    QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
+    QSystemTrayIcon, QTableView, QVBoxLayout, QWidget,
 )
 
 from app_info import APP_NAME, APP_VERSION
+from ai_dialog import AIDialog
+from ai_support import GUIDE, load_ai_config, save_ai_config
+from ui_icons import application_icon, stroke_icon
+from ui_theme import light_palette
+from ui_transitions import PageTurnStack
 from automation import BACKUP_INTERVAL, DEFAULTS, HEALTH_INTERVAL, Engine
 from catalog import (
-    CLOUDFLARE_CHECK, DEFAULT_CHECK, PUBLIC_SETTINGS, SOURCE_FILENAME,
+    CLOUDFLARE_CHECK, DEFAULT_AI_MODEL, DEFAULT_CHECK, PUBLIC_SETTINGS, SOURCE_FILENAME,
     CatalogDownloadError, CatalogSource, VPNError, atomic, catalog_settings, check_page_password,
     direct_hosts, encrypt, load_catalog_source, page_password_hash,
 )
@@ -38,42 +43,42 @@ import updates
 
 STYLE = """
 QMainWindow, QWidget#mainSurface, QDialog { background:#ffffff; }
-QWidget { color:#202321; }
+QWidget { color:#0d0d0d; }
 QLabel[role="headline"] { font-size:23px; font-weight:700; }
 QLabel[role="section"] { font-size:16px; font-weight:650; }
-QLabel[role="muted"] { color:#575f59; }
-QLabel[role="warning"] { color:#a02d25; }
+QLabel[role="muted"] { color:#5d5d5d; }
+QLabel[role="warning"] { color:#262626; font-weight:600; }
 QFrame#connectionCard, QFrame#settingsCard, QFrame#passwordCard {
-    background:#f7f8f7; border:1px solid #e4e8e5; border-radius:18px;
+    background:#f7f7f7; border:1px solid #e5e5e5; border-radius:18px;
 }
 QPushButton {
-    background:#fff; border:1px solid #dce1dd; border-radius:16px;
+    background:#fff; border:1px solid #dedede; border-radius:16px;
     padding:5px 16px; min-height:20px; font-weight:600;
 }
-QPushButton:hover { background:#f3f5f3; border-color:#bfc9c1; }
-QPushButton:pressed { background:#e8eee9; }
-QPushButton:focus { border-color:#438064; }
-QPushButton[primary="true"] { background:#232925; color:#fff; border-color:#232925; min-width:74px; }
-QPushButton[primary="true"]:hover { background:#36453b; }
-QPushButton[primary="true"]:pressed { background:#17251c; }
-QPushButton[primary="true"]:focus { border-color:#6f9b80; }
+QPushButton:hover { background:#f4f4f4; border-color:#c8c8c8; }
+QPushButton:pressed { background:#e8e8e8; }
+QPushButton:focus { border-color:#767676; }
+QPushButton[primary="true"] { background:#0d0d0d; color:#fff; border-color:#0d0d0d; min-width:74px; }
+QPushButton[primary="true"]:hover { background:#2f2f2f; }
+QPushButton[primary="true"]:pressed { background:#000000; }
+QPushButton[primary="true"]:focus { border-color:#767676; }
 QPushButton:disabled, QPushButton[primary="true"]:disabled {
-    background:#eef1ee; color:#727971; border-color:#e2e6e2;
+    background:#eeeeee; color:#767676; border-color:#e5e5e5;
 }
 QLineEdit, QComboBox, QSpinBox, QPlainTextEdit {
-    background:#fff; border:1px solid #dce1dd; border-radius:10px;
-    padding:5px 9px; min-height:21px; selection-background-color:#dcebe0; selection-color:#202321;
+    background:#fff; border:1px solid #dedede; border-radius:10px;
+    padding:5px 9px; min-height:21px; selection-background-color:#e5e5e5; selection-color:#0d0d0d;
 }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QPlainTextEdit:focus { border-color:#438064; }
-QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled { background:#f1f3f1; color:#676e68; }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QPlainTextEdit:focus { border-color:#767676; }
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled { background:#f2f2f2; color:#696969; }
 QComboBox { padding-right:28px; }
 QComboBox::drop-down {
     subcontrol-origin:padding; subcontrol-position:top right; width:25px; border:0;
 }
 QComboBox::down-arrow { image:url(:/qt-project.org/styles/commonstyle/images/arrow-down-16.png);
     width:11px; height:11px; }
-QComboBox QAbstractItemView { background:#fff; border:1px solid #dce1dd; outline:0;
-    selection-background-color:#e7efe8; selection-color:#202321; }
+QComboBox QAbstractItemView { background:#fff; border:1px solid #dedede; outline:0;
+    selection-background-color:#e9e9e9; selection-color:#0d0d0d; }
 QSpinBox { padding-right:27px; }
 QSpinBox::up-button, QSpinBox::down-button { subcontrol-origin:padding; width:23px; border:0; }
 QSpinBox::up-button { subcontrol-position:top right; }
@@ -82,30 +87,41 @@ QSpinBox::up-arrow { image:url(:/qt-project.org/styles/commonstyle/images/arrow-
     width:9px; height:9px; }
 QSpinBox::down-arrow { image:url(:/qt-project.org/styles/commonstyle/images/arrow-down-16.png);
     width:9px; height:9px; }
-QTabWidget::pane { border:0; background:#fff; }
-QTabBar::tab {
-    background:transparent; border:1px solid transparent; border-radius:16px;
-    color:#575f59; margin-right:5px; padding:6px 14px; min-height:19px;
+QWidget#sidebar { background:#f7f7f7; border-right:1px solid #e5e5e5; }
+QLabel#sidebarBrand { font-size:17px; font-weight:700; }
+QPushButton#askAI {
+    text-align:left; background:transparent; border:1px solid #dedede; border-radius:11px;
+    padding:7px 10px; color:#0d0d0d; font-weight:550;
 }
-QTabBar::tab:hover { background:#f4f6f4; }
-QTabBar::tab:selected { background:#eaf0eb; color:#202321; font-weight:650; }
-QTabBar::tab:focus { border-color:#94aa99; }
+QPushButton#askAI:hover { background:#ededed; border-color:#d6d6d6; }
+QPushButton#askAI:pressed { background:#e6e6e6; }
+QPushButton#askAI:focus { border-color:#767676; }
+QListWidget#sidebarNav {
+    background:transparent; border:0; outline:0; font-weight:550;
+}
+QListWidget#sidebarNav::item {
+    background:transparent; border:1px solid transparent; border-radius:10px;
+    color:#5d5d5d; padding:8px 11px; min-height:18px;
+}
+QListWidget#sidebarNav::item:hover { background:#ededed; }
+QListWidget#sidebarNav::item:selected { background:#e6e6e6; color:#0d0d0d; }
+QListWidget#sidebarNav::item:selected:focus { border-color:#8b8b8b; }
 QTableWidget, QTableView {
-    background:#fff; alternate-background-color:#fbfcfb; border:1px solid #e4e8e5;
-    border-radius:14px; outline:0; selection-background-color:#e7efe8; selection-color:#202321;
+    background:#fff; alternate-background-color:#fafafa; border:1px solid #e5e5e5;
+    border-radius:14px; outline:0; selection-background-color:#e9e9e9; selection-color:#0d0d0d;
 }
 QHeaderView { background:#fff; }
 QHeaderView::section {
-    background:#f6f8f6; border:0; border-bottom:1px solid #e4e8e5;
-    color:#535b55; padding:9px 10px; font-weight:600;
+    background:#f5f5f5; border:0; border-bottom:1px solid #e5e5e5;
+    color:#4d4d4d; padding:9px 10px; font-weight:600;
 }
 QHeaderView::section:first { border-top-left-radius:12px; }
 QHeaderView::section:last { border-top-right-radius:12px; }
-QTableWidget::item, QTableView::item { border-bottom:1px solid #edf0ed; padding-left:9px; }
-QStatusBar { background:#fff; color:#575f59; border-top:1px solid #edf0ed; }
+QTableWidget::item, QTableView::item { border-bottom:1px solid #ededed; padding-left:9px; }
+QStatusBar { background:#fff; color:#5d5d5d; border-top:1px solid #ededed; }
 QStatusBar::item { border:0; }
-QProgressBar { background:#e6ece8; border:0; border-radius:4px; }
-QProgressBar::chunk { background:#438064; border-radius:4px; }
+QProgressBar { background:#e8e8e8; border:0; border-radius:4px; }
+QProgressBar::chunk { background:#262626; border-radius:4px; }
 """
 
 
@@ -183,6 +199,18 @@ class CatalogEditor(QWidget):
         source_layout.addWidget(banner(f"安装版从用户数据目录读取 {SOURCE_FILENAME}。", "muted"))
         box.addWidget(source_panel)
         box.addWidget(banner("制作加密目录", "section"))
+        self.ai_key = QLineEdit()
+        self.ai_key.setMaxLength(512)
+        self.ai_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ai_key.setPlaceholderText("可选，仅随加密 VXP 导出")
+        ai_form = QFormLayout()
+        ai_form.addRow("DeepSeek API Key", self.ai_key)
+        self.ai_model = EndpointChoice([("DeepSeek Flash（默认）", DEFAULT_AI_MODEL),
+                                        ("DeepSeek V4 Pro", "deepseek-v4-pro")],
+                                       "输入 DeepSeek 模型 ID")
+        self.ai_model.custom.setMaxLength(128)
+        ai_form.addRow("AI 模型", self.ai_model)
+        box.addLayout(ai_form)
         self.rows = QTableWidget(1, 3)
         self.rows.setShowGrid(False)
         self.rows.verticalHeader().setDefaultSectionSize(38)
@@ -270,7 +298,10 @@ class CatalogEditor(QWidget):
             if not source.configured:
                 raise VPNError("请先填写 VXP 链接和密钥")
             config = self.window.settings()
-            data = encrypt(rows, source.key, {key: config[key] for key in PUBLIC_SETTINGS})
+            model = self.ai_model.address()
+            data = encrypt(rows, source.key, {key: config[key] for key in PUBLIC_SETTINGS},
+                           ai_key=self.ai_key.text().strip() or None,
+                           ai_model=model if model != DEFAULT_AI_MODEL else None)
             path, _ = QFileDialog.getSaveFileName(self, "保存加密目录", "catalog.vxp", "VPN-X 目录 (*.vxp)")
             if not path:
                 return
@@ -400,6 +431,11 @@ class Window(QMainWindow):
         self.config_file = data_dir / "settings.json"
         self.source_file = data_dir / SOURCE_FILENAME
         self.catalog_source = CatalogSource()
+        self.ai_key = ""
+        self.ai_model = DEFAULT_AI_MODEL
+        self.ai_dialog = None
+        self.waiting_for_ai_exit = False
+        self.last_job_ok = None
         self.source_error = ""
         self.install_root = install_root
         self.next_update = 0
@@ -442,18 +478,26 @@ class Window(QMainWindow):
         panel = QWidget()
         panel.setObjectName("mainSurface")
         self.setCentralWidget(panel)
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(22, 16, 22, 12)
+        split = QHBoxLayout(panel)
+        split.setContentsMargins(0, 0, 0, 0)
+        split.setSpacing(0)
+        split.addWidget(self.sidebar())
+
+        content = QWidget()
+        split.addWidget(content, 1)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(22, 9, 22, 12)
         layout.setSpacing(12)
-        self.log_button = button("显示日志", self.toggle_log)
-        self.statusBar().addPermanentWidget(self.log_button)
-        self.tabs = QTabWidget()
-        self.tabs.setDocumentMode(True)
-        self.tabs.addTab(self.dashboard(), "代理控制")
-        self.tabs.addTab(self.settings_page(), "设置")
-        self.tabs.addTab(self.catalog_page(), "高级模式")
-        self.tabs.currentChanged.connect(self.lock_catalog_page)
-        layout.addWidget(self.tabs, 1)
+        self.pages = PageTurnStack()
+        for title, icon, page in (("代理控制", "proxy", self.dashboard()),
+                                  ("代理设置", "settings", self.settings_page()),
+                                  ("高级模式", "advanced", self.catalog_page()),
+                                  ("运行日志", "logs", self.log_page())):
+            self.pages.addWidget(page)
+            self.navigation.addItem(QListWidgetItem(stroke_icon(icon), title))
+        self.navigation.currentRowChanged.connect(self.turn_page)
+        self.navigation.setCurrentRow(0)
+        layout.addWidget(self.pages, 1)
         self.progress_panel = QWidget()
         progress_layout = QVBoxLayout(self.progress_panel)
         progress_layout.setContentsMargins(0, 0, 0, 0)
@@ -469,14 +513,80 @@ class Window(QMainWindow):
         self.progress_timer = QTimer(self)
         self.progress_timer.setSingleShot(True)
         self.progress_timer.timeout.connect(self.progress_panel.hide)
+    def log_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 14, 0, 0)
+        layout.addWidget(banner("运行日志", "headline"))
+        layout.addWidget(banner(f"保留最近 {LOG_LIMIT:,} 条运行记录。", "muted"))
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setPlaceholderText("执行步骤将在这里显示。")
         self.log_view.setMaximumBlockCount(LOG_LIMIT)
         self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self.log_view.setFixedHeight(158)
-        self.log_view.hide()
-        layout.addWidget(self.log_view)
+        layout.addWidget(self.log_view, 1)
+        return page
+
+    def sidebar(self):
+        panel = QWidget()
+        panel.setObjectName("sidebar")
+        panel.setFixedWidth(196)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(12, 19, 12, 15)
+        layout.setSpacing(12)
+        name = banner(APP_NAME, "brand")
+        name.setObjectName("sidebarBrand")
+        name.setContentsMargins(9, 0, 0, 0)
+        layout.addWidget(name)
+        ask = button("Ask AI", self.open_ai)
+        ask.setObjectName("askAI")
+        ask.setIcon(stroke_icon("search"))
+        ask.setIconSize(QSize(21, 21))
+        ask.setAccessibleName("Ask AI，打开 VPN-X AI")
+        layout.addWidget(ask)
+
+        self.navigation = QListWidget()
+        self.navigation.setObjectName("sidebarNav")
+        self.navigation.setAccessibleName("页面导航")
+        self.navigation.setSpacing(2)
+        self.navigation.setIconSize(QSize(22, 22))
+        self.navigation.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        layout.addWidget(self.navigation, 1)
+
+        version = banner(f"V{APP_VERSION}", "muted")
+        version.setContentsMargins(10, 0, 0, 0)
+        layout.addWidget(version)
+        return panel
+
+    def open_ai(self):
+        if self.ai_dialog is None:
+            try:
+                self.ai_dialog = AIDialog(self, self.config_file.parent)
+            except OSError:
+                QMessageBox.warning(self, "VPN-X AI", "找不到本地使用指南，请完整安装 VPN-X。")
+                return
+        self.ai_dialog.present()
+
+    def ai_state(self):
+        engine = self.engine
+        current = engine.current
+        state = "需要恢复代理" if not current and engine.own.journal.exists() else "代理未启动"
+        if current:
+            state = "节点检测失败" if engine.health_failures >= 2 else "代理运行中"
+        settings = engine.settings if current and engine.settings else getattr(self, "saved", DEFAULTS)
+        connection = "虚拟网卡" if settings["network"] == "tun" else "系统代理"
+        mode = "规则" if settings["mode"] == "rule" else "全局"
+        task = self.job_title if self.job else "空闲"
+        checked = engine.last_sync
+        checked = datetime.fromtimestamp(checked).strftime("%Y-%m-%d %H:%M") if isinstance(checked, (int, float)) and 0 < checked < 4e9 else "未同步"
+        last = "尚无记录" if self.last_job_ok is None else ("成功" if self.last_job_ok else "失败")
+        return (f"版本 V{APP_VERSION}；{state}；{connection}/{mode}；备用 {len(engine.available_backups())} 个；"
+                f"当前任务：{task}；上次任务：{last}；上次目录同步：{checked}；"
+                f"订阅问题 {len(engine.failures)} 项；"
+                f"待应用订阅：{'有' if engine.pending_profiles is not None else '无'}。")
+
+    def ai_secrets(self):
+        return (self.ai_key, self.catalog_source.key, self.catalog_source.url, self.catalog_source.update_url)
 
     def dashboard(self):
         page = QWidget()
@@ -495,16 +605,7 @@ class Window(QMainWindow):
         self.warning = banner("", "warning")
         self.warning.setWordWrap(True)
         self.warning.hide()
-        title_row = QHBoxLayout()
-        title_row.setSpacing(9)
-        icon = QApplication.windowIcon()
-        if not icon.isNull():
-            mark = QLabel()
-            mark.setPixmap(icon.pixmap(33, 33))
-            mark.setFixedSize(33, 33)
-            title_row.addWidget(mark)
-        title_row.addWidget(self.status, 1)
-        content.addLayout(title_row)
+        content.addWidget(self.status)
         content.addWidget(self.detail)
         content.addWidget(self.warning)
         row = QHBoxLayout()
@@ -620,7 +721,7 @@ class Window(QMainWindow):
         return page
 
     def catalog_page(self):
-        self.catalog_stack = QStackedWidget()
+        self.catalog_stack = PageTurnStack()
         login = QWidget()
         layout = QVBoxLayout(login)
         layout.addStretch()
@@ -647,12 +748,23 @@ class Window(QMainWindow):
         self.catalog_stack.addWidget(self.catalog_editor)
         return self.catalog_stack
 
-    def lock_catalog_page(self, index):
+    def turn_page(self, index):
+        if index < 0 or index == self.pages.currentIndex():
+            return
         if index != 2:
-            self.catalog_stack.setCurrentIndex(0)
-            self.page_password.clear()
-            self.page_error.clear()
-            self.catalog_editor.hide_key()
+            self.lock_catalog_page()
+        self.pages.turn_to(index)
+
+    def lock_catalog_page(self):
+        # Relock before the outgoing page is captured for animation.
+        self.catalog_stack.turn.clear()
+        self.catalog_stack.setCurrentIndex(0)
+        self.page_password.clear()
+        self.page_error.clear()
+        self.catalog_editor.hide_key()
+        self.catalog_editor.ai_key.clear()
+        self.catalog_editor.ai_model.set_address(DEFAULT_AI_MODEL)
+        self.catalog_editor.ai_model.custom.clear()
 
     def unlock_catalog_page(self):
         password = self.page_password.text()
@@ -661,6 +773,8 @@ class Window(QMainWindow):
             self.page_error.setText("密码不正确")
             return
         self.page_error.clear()
+        self.catalog_editor.ai_key.setText(self.ai_key)
+        self.catalog_editor.ai_model.set_address(self.ai_model)
         table = self.catalog_editor.rows
         if table.rowCount() == 1 and all(table.item(0, col) is None for col in range(table.columnCount())):
             for index, vendor in enumerate(self.engine.catalog or []):
@@ -670,7 +784,7 @@ class Window(QMainWindow):
                 table.setItem(index, 1, QTableWidgetItem(vendor.url))
                 if vendor.priority is not None:
                     table.setItem(index, 2, QTableWidgetItem(str(vendor.priority)))
-        self.catalog_stack.setCurrentIndex(1)
+        self.catalog_stack.turn_to(1)
 
     def change_page_password(self):
         if self.job:
@@ -712,17 +826,11 @@ class Window(QMainWindow):
             if not at_bottom:
                 scrollbar.setValue(previous)
 
-    def toggle_log(self):
-        show = self.log_view.isHidden()
-        self.log_view.setVisible(show)
-        if show:
-            self.flush_events()
-        self.log_button.setText("隐藏日志" if show else "显示日志")
-
     def load_catalog_source(self):
         try:
             defaults = self.install_root / SOURCE_FILENAME if self.install_root else None
             self.catalog_source = load_catalog_source(self.source_file, defaults)
+            self.reload_ai_config()
         except (VPNError, OSError) as error:
             reason = str(error) if isinstance(error, VPNError) else "无法读取或写入文件"
             self.source_error = f"{SOURCE_FILENAME} 无法使用：{reason}。请在「高级模式」检查目录来源。"
@@ -743,6 +851,7 @@ class Window(QMainWindow):
             self.warning.hide()
         self.source_error = ""
         self.catalog_source = source
+        self.reload_ai_config()
         self.saved.update(source.settings())
         self.catalog_editor.show_source(source)
         if not self.engine.current:
@@ -750,6 +859,13 @@ class Window(QMainWindow):
                                 "请先在「高级模式」填写或导入目录来源。")
         self.statusBar().showMessage("目录来源已保存", 5000)
         self.events.line("已保存目录来源")
+
+    def reload_ai_config(self):
+        try:
+            self.ai_key, self.ai_model = load_ai_config(self.config_file.parent, self.catalog_source.identity())
+        except VPNError as err:
+            self.ai_key, self.ai_model = "", DEFAULT_AI_MODEL
+            self.events.line(str(err))
 
     def load_settings(self):
         data = dict(DEFAULTS, **self.catalog_source.settings())
@@ -958,6 +1074,7 @@ class Window(QMainWindow):
         self.job.deleteLater()
         self.job = None
         error = self.job_error
+        self.last_job_ok = not bool(error)
         if error or self.silent_job:
             self.progress_panel.hide()
         else:
@@ -967,6 +1084,17 @@ class Window(QMainWindow):
             self.progress_timer.start(1600)
         imported = self.engine.imported_settings
         self.engine.imported_settings = {}
+        ai_config = self.engine.imported_ai
+        self.engine.imported_ai = None
+        if ai_config is not None and ai_config != (self.ai_key, self.ai_model):
+            try:
+                save_ai_config(self.config_file.parent, self.catalog_source.identity(), *ai_config)
+                self.ai_key, self.ai_model = ai_config
+                if self.catalog_stack.currentIndex() == 1:
+                    self.catalog_editor.ai_key.setText(self.ai_key)
+                    self.catalog_editor.ai_model.set_address(self.ai_model)
+            except Exception:
+                self.events.line("无法安全保存 VXP 中的 AI 凭据")
         if imported:
             self.saved = dict(self.saved, **imported)
             self.apply_fields(self.saved)
@@ -1183,6 +1311,13 @@ class Window(QMainWindow):
             self.exit_action = action
             self.run_job("关闭代理并退出", self.engine.shutdown)
             return
+        if self.ai_dialog is not None and self.ai_dialog.worker is not None:
+            if not self.waiting_for_ai_exit:
+                self.waiting_for_ai_exit = True
+                self.exit_action = action
+                self.statusBar().showMessage("代理已关闭，正在等待 AI 请求结束…")
+                self.ai_dialog.worker.finished.connect(self.resume_exit_after_ai)
+            return
         if action == "update":
             try:
                 subprocess.Popen([sys.executable, "--apply-update", str(os.getpid())],
@@ -1193,7 +1328,15 @@ class Window(QMainWindow):
                 return
         if self.tray:
             self.tray.hide()
+        if self.ai_dialog is not None:
+            self.ai_dialog.hide()
         QApplication.instance().quit()
+
+    @Slot()
+    def resume_exit_after_ai(self):
+        self.waiting_for_ai_exit = False
+        action, self.exit_action = self.exit_action, None
+        self.finish_exit(action)
 
     def update_source_id(self):
         return hashlib.sha256(self.catalog_source.update_url.encode()).hexdigest()
@@ -1331,13 +1474,15 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
     assets = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-    icon = QIcon(str(assets / "logo.ico"))
+    logo = assets / "logo.ico"
+    icon = QIcon(str(logo)) if getattr(sys, "frozen", False) else application_icon(logo)
     app.setWindowIcon(icon)
     app.setStyle("Fusion")
+    app.setPalette(light_palette())
     app.setFont(QFont("Microsoft YaHei UI", 10))
     app.setStyleSheet(STYLE)
     if sys.argv[1:] == ["--check-startup"]:
-        if icon.pixmap(32, 32).isNull():
+        if icon.pixmap(32, 32).isNull() or not GUIDE.is_file():
             return 1
         # Exercise the real lock and window startup with isolated settings and no background jobs.
         with TemporaryDirectory(prefix="vpnx-startup-") as folder:
