@@ -14,5 +14,6 @@ installers/*.exe
 /updates/
 /ai-key.json.dpapi
 /ai-usage.json
+/.pass
 *.pem
 update-public-key.bin

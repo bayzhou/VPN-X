@@ -11,6 +11,9 @@ from zipfile import ZipFile
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 import pywintypes
+import requests
+import win32con
+import win32file
 
 from app_info import APP_VERSION, EXE_NAME
 from automation import Engine
@@ -98,6 +101,13 @@ class Updates(unittest.TestCase):
             for _ in range(2):
                 self.assertEqual(updates.check(self.root, manifest_url, lambda *_: None).version, "99.1")
         self.assertEqual(requested, [manifest_url, manifest["url"], manifest_url])
+
+    def test_download_failure_reports_stage_without_url(self):
+        address = "https://example.test/manifest.json?token=secret"
+        with (patch.object(updates, "trust_key", self.key.public_key().public_bytes_raw),
+              patch.object(updates, "_download", side_effect=requests.exceptions.Timeout(address))):
+            with self.assertRaisesRegex(VPNError, "^下载更新清单失败：连接或下载超时$"):
+                updates.check(self.root, address, lambda *_: None)
 
     def test_windows_app_version_preserves_the_localized_name(self):
         (self.root / "current-version.txt").write_text("99.1\n", encoding="ascii")
@@ -192,7 +202,8 @@ class Updates(unittest.TestCase):
                 def extract(path, tool, staging):
                     with ZipFile(path) as source:
                         source.extractall(staging)
-                    return staging / "VPN-X"
+                    return staging / "VPN-X", tuple(Path(name).relative_to("VPN-X")
+                                                    for name in updates.archive_files(path))
                 def launch(args, **kwargs):
                     starts.append(args)
                     self.assertEqual(updates.current_version(root), APP_VERSION)
@@ -207,12 +218,23 @@ class Updates(unittest.TestCase):
                     if registry_error:
                         raise PermissionError("Registry is read-only")
 
+                process = Mock(spec=["Close"])
+                # A retry can encounter files written before the previous launch failed.
+                stale = updates.version_exe(root, "99.1").parent / "unverified.dll"
+                stale.parent.mkdir()
+                stale.write_bytes(b"stale runtime")
                 with (patch.object(updates, "trust_key", self.key.public_key().public_bytes_raw),
                       patch.object(updates, "extract_package", extract),
-                      patch.object(updates.win32api, "OpenProcess", side_effect=pywintypes.error(87, "OpenProcess", "exited")),
-                      patch.object(updates, "check_runtime"), patch.object(subprocess, "Popen", launch),
+                      patch.object(updates.win32api, "OpenProcess", return_value=process),
+                      patch.object(updates.win32event, "WaitForSingleObject", return_value=updates.win32event.WAIT_OBJECT_0),
+                      patch.object(updates, "check_runtime") as check, patch.object(subprocess, "Popen", launch),
                       patch.object(updates, "sync_windows_app_version", side_effect=sync_version) as sync):
-                    self.assertEqual(updates.apply_pending(root, 98765), 0 if healthy else 1)
+                    notify = Mock()
+                    self.assertEqual(updates.apply_pending(root, 98765, notify), 0 if healthy else 1)
+                    notify.assert_not_called()
+                    process.Close.assert_called_once_with()
+                    self.assertEqual(check.call_args.args[0], stale.parent)
+                self.assertFalse(stale.exists())
                 self.assertEqual(updates.current_version(root), "99.1" if healthy else APP_VERSION)
                 self.assertEqual(old.read_bytes(), b"old runtime")
                 if healthy:
@@ -220,10 +242,49 @@ class Updates(unittest.TestCase):
                     self.assertEqual(len(starts), 1)
                 else:
                     sync.assert_not_called()
-                    self.assertEqual(starts[-1], [str(old), "--update-failed"])
+                    self.assertEqual(starts[-1], [str(old), "--update-failed",
+                                                 "启动新版失败：新版在确认启动前退出（退出码 1）"])
                 with (patch.object(updates, "trust_key", self.key.public_key().public_bytes_raw),
                       patch.object(updates, "sync_windows_app_version")):
                     updates.maintain_installation(root, updates.current_version(root), lambda _: None)
                 self.assertEqual(old.parent.exists(), not healthy)
                 self.assertEqual(archive.exists(), not healthy)
                 self.assertEqual((cache / "manifest.json").exists(), not healthy)
+
+    def test_can_install_files_when_windows_blocks_staged_directory_rename(self):
+        staging = self.root / "staging"
+        staging.mkdir()
+        source = staging / EXE_NAME
+        source.write_bytes(b"runtime")
+        target = self.root / "1.7"
+        lock = win32file.CreateFile(str(source), win32con.GENERIC_READ, win32con.FILE_SHARE_READ,
+                                    None, win32con.OPEN_EXISTING, 0, None)
+        try:
+            with self.assertRaises(PermissionError) as blocked:
+                staging.rename(target)
+            self.assertEqual(blocked.exception.winerror, 5)
+            updates.write_version_files(staging, target, [Path(EXE_NAME)])
+        finally:
+            lock.Close()
+        self.assertEqual((target / EXE_NAME).read_bytes(), b"runtime")
+
+        lock = win32file.CreateFile(str(source), win32con.GENERIC_READ, 0, None, win32con.OPEN_EXISTING, 0, None)
+        try:
+            with patch.object(updates.time, "sleep", side_effect=lambda _: lock.Close()) as wait:
+                updates.write_version_files(staging, self.root / "1.8", [Path(EXE_NAME)])
+            wait.assert_called_once()
+        finally:
+            lock.Close()
+
+    def test_failed_rollback_launch_still_reports_the_original_failure(self):
+        marker = self.root / "current-version.txt"
+        marker.write_text(APP_VERSION, encoding="ascii")
+        (self.root / "updates").mkdir()
+        notify = Mock()
+        with (patch.object(updates, "trust_key", self.key.public_key().public_bytes_raw),
+              patch.object(updates.win32api, "OpenProcess", side_effect=pywintypes.error(87, "OpenProcess", "exited")),
+              patch.object(subprocess, "Popen", side_effect=PermissionError(13, "denied", "private-path", 5))):
+            self.assertEqual(updates.apply_pending(self.root, 98765, notify), 1)
+        notify.assert_called_once_with("校验更新清单和更新包失败：所需文件或目录不存在\n"
+                                       "重新启动原版本失败：拒绝访问（Windows 错误 5）")
+        self.assertEqual(updates.current_version(self.root), APP_VERSION)

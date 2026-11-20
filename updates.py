@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
 import base64
+import errno
 import hashlib
 import json
 import msvcrt
@@ -138,6 +139,39 @@ def package_matches(path, manifest):
         return False
 
 
+def failure_detail(error):
+    """Describe failures without exposing URLs, commands or local paths."""
+    if isinstance(error, VPNError):
+        return str(error)
+    if isinstance(error, requests.exceptions.Timeout):
+        return "连接或下载超时"
+    if isinstance(error, requests.exceptions.SSLError):
+        return "HTTPS 证书验证或 TLS 握手失败"
+    if isinstance(error, requests.RequestException):
+        return "无法连接更新服务器或下载连接已中断"
+    if isinstance(error, BadZipFile):
+        return "更新包 ZIP 格式无效或文件已损坏"
+    if isinstance(error, subprocess.TimeoutExpired):
+        return f"程序在 {error.timeout:g} 秒内未完成"
+    if isinstance(error, subprocess.CalledProcessError):
+        return f"程序退出码为 {error.returncode}"
+    code = getattr(error, "winerror", None)
+    if isinstance(code, int):
+        message = {2: "所需文件不存在", 3: "所需目录不存在", 5: "拒绝访问",
+                   32: "文件正被其他进程占用", 33: "更新文件或目录已被锁定",
+                   112: "磁盘空间不足"}.get(code, "Windows 操作失败")
+        return f"{message}（Windows 错误 {code}）"
+    if isinstance(error, FileNotFoundError):
+        return "所需文件或目录不存在"
+    if isinstance(error, PermissionError):
+        return "拒绝访问或文件被其他进程占用"
+    if isinstance(error, OSError):
+        if error.errno == errno.ENOSPC:
+            return "磁盘空间不足"
+        return f"读写文件或目录失败（错误码 {error.errno}）" if error.errno else "读写文件或目录失败"
+    return f"发生异常（{type(error).__name__}）"
+
+
 def _download(address, out, maximum, progress, cancelled):
     from urllib.parse import urljoin
     started = time.monotonic()
@@ -167,38 +201,47 @@ def _download(address, out, maximum, progress, cancelled):
 
 def check(root, address, progress, cancelled=lambda: None):
     import io
-    key = trust_key()
     # Protected by Program Files permissions on a normal installation. Never execute from a user temp folder.
     cache = root / "updates"
+    stage = "读取更新公钥"
     try:
+        key = trust_key()
+        stage = "下载更新清单"
         contents = io.BytesIO()
         _download(address, contents, 16384, lambda _: None, cancelled)
         raw = contents.getvalue()
+        stage = "校验更新清单"
         item = verify_manifest(raw, key)
         if version(item.version) <= version(APP_VERSION):
             return None
+        stage = "打开更新缓存"
         with install_lock(root):
             cache.mkdir(exist_ok=True)
             archive = cache / "update.zip"
             if not package_matches(archive, item):
                 part = cache / f"{secrets.token_hex(12)}.part"
                 try:
+                    stage = "下载更新包"
                     with part.open("xb") as stream:
                         _download(item.url, stream, item.size, lambda done: progress("下载更新包", done, item.size),
                                   cancelled)
+                    stage = "校验更新包"
                     if not package_matches(part, item):
                         raise VPNError("更新包 SHA-256 校验失败")
                     archive_files(part)
+                    stage = "保存更新包"
                     (cache / "manifest.json").unlink(missing_ok=True)
                     os.replace(part, archive)
                 finally:
                     part.unlink(missing_ok=True)
             else:
+                stage = "校验已下载的更新包"
                 archive_files(archive)
+            stage = "保存更新清单"
             atomic(cache / "manifest.json", raw)
         return item
-    except (OSError, requests.RequestException, BadZipFile) as err:
-        raise VPNError("更新下载失败，请检查网络或安装目录权限") from err
+    except (OSError, VPNError, BadZipFile) as err:
+        raise VPNError(f"{stage}失败：{failure_detail(err)}") from err
 
 
 def archive_files(archive):
@@ -251,7 +294,35 @@ def extract_package(archive, seven_zip, staging):
             actual.add(file.relative_to(staging).as_posix())
     if actual != wanted:
         raise VPNError("更新包解压内容与清单不一致")
-    return staging / "VPN-X"
+    return staging / "VPN-X", tuple(sorted(Path(name).relative_to("VPN-X") for name in wanted))
+
+
+def retry_file_access(operation, *args, **kwargs):
+    deadline = time.monotonic() + 8
+    while True:
+        try:
+            return operation(*args, **kwargs)
+        except OSError as err:
+            code = getattr(err, "winerror", None)
+            retryable = code in (5, 32, 33) or (code is None and isinstance(err, PermissionError))
+            if not retryable or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.25)
+
+
+def validate_version_directory(path):
+    info = path.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            or path.resolve(strict=True) != path):
+        raise VPNError("版本目录包含链接或路径异常")
+
+
+def write_version_files(content, target, files):
+    retry_file_access(target.mkdir)
+    for relative in files:
+        dest = target / relative
+        retry_file_access(dest.parent.mkdir, parents=True, exist_ok=True)
+        retry_file_access(shutil.copyfile, content / relative, dest)
 
 
 def check_runtime(content, item, key):
@@ -261,8 +332,11 @@ def check_runtime(content, item, key):
     if (info["FileVersionMS"] != (major << 16 | minor) or info["FileVersionLS"] != 0 or
             (content / "_internal" / "update-public-key.bin").read_bytes() != key):
         raise VPNError("更新包中的程序版本或更新公钥与清单不一致")
-    for flag in ("--check-startup", "--check-clash"):
-        subprocess.run([str(exe), flag], check=True, timeout=30, cwd=content)
+    for flag, label in (("--check-startup", "界面自检"), ("--check-clash", "Clash 内核自检")):
+        try:
+            subprocess.run([str(exe), flag], check=True, timeout=30, cwd=content)
+        except (subprocess.SubprocessError, OSError) as err:
+            raise VPNError(f"{label}失败：{failure_detail(err)}") from err
 
 
 @contextmanager
@@ -370,21 +444,29 @@ def maintain_installation(root, release, log):
         time.sleep(0.5)
 
 
-def apply_pending(root, parent):
+def apply_pending(root, parent, notify_failure):
     old = version_exe(root, APP_VERSION)
+    stage = "等待原版本退出"
+    can_restart = False
+    committed = False
     try:
-        with install_lock(root):
-            # Open the previous GUI before modifying any files; its normal exit released the proxy and lock.
+        # The tray and proxy must have shut down before the previous runtime is relaunched.
+        try:
+            process = win32api.OpenProcess(0x00100000, False, parent)
+        except pywintypes.error as err:
+            if (getattr(err, "winerror", None) or err.args[0]) != 87:  # Process already exited.
+                raise
+            process = None
+        if process is not None:
             try:
-                process = win32api.OpenProcess(0x00100000, False, parent)
-            except pywintypes.error as err:
-                if (getattr(err, "winerror", None) or err.args[0]) != 87:  # Process already exited.
-                    raise
-                process = None
-            if process is not None:
-                with process:
-                    if win32event.WaitForSingleObject(process, 30000) != win32event.WAIT_OBJECT_0:
-                        raise VPNError("VPN-X 尚未退出，更新已取消")
+                if win32event.WaitForSingleObject(process, 30000) != win32event.WAIT_OBJECT_0:
+                    raise VPNError("原版本在 30 秒内未退出")
+            finally:
+                process.Close()
+        can_restart = True
+        stage = "锁定更新目录"
+        with install_lock(root):
+            stage = "校验更新清单和更新包"
             if current_version(root) != APP_VERSION:
                 raise VPNError("当前版本已经切换")
             cache = root / "updates"
@@ -396,28 +478,48 @@ def apply_pending(root, parent):
             new = version_exe(root, item.version)
             nonce = secrets.token_hex(12)
             staging = cache / ("stage-" + nonce)
+            stage = "解压更新包"
             staging.mkdir()
             health = cache / ("health-" + nonce)
             child = None
             try:
-                content = extract_package(archive, old.parent / "7zip" / "7z.exe", staging)
-                check_runtime(content, item, key)
-                # If an earlier attempt got this far, leave its files untouched and install into an empty slot.
-                if new.parent.exists():
-                    new.parent.rename(cache / ("previous-" + nonce))
-                content.rename(new.parent)
+                content, files = extract_package(archive, old.parent / "7zip" / "7z.exe", staging)
+                stage = "检查版本安装目录"
+                validate_version_directory(new.parent.parent)
                 try:
+                    validate_version_directory(new.parent)
+                except FileNotFoundError:
+                    pass
+                else:
+                    stage = "清理上次未启用的新版目录"
+                    retry_file_access(shutil.rmtree, new.parent)
+                # The launcher selects the old slot until the new process confirms a healthy start.
+                stage = "写入新版文件到安装目录"
+                write_version_files(content, new.parent, files)
+                stage = "检查新版程序"
+                check_runtime(new.parent, item, key)
+                try:
+                    stage = "启动新版"
                     child = subprocess.Popen([str(new), "--update-health", nonce], cwd=new.parent)
                     deadline = time.monotonic() + 30
                     while not health.is_file() and child.poll() is None and time.monotonic() < deadline:
                         time.sleep(0.2)
-                    if not health.is_file() or child.poll() is not None:
-                        raise VPNError("新版本启动检查失败")
+                    exit_code = child.poll()
+                    if exit_code is not None:
+                        raise VPNError(f"新版在确认启动前退出（退出码 {exit_code}）")
+                    if not health.is_file():
+                        raise VPNError("等待新版确认启动超过 30 秒")
+                    stage = "切换当前版本"
                     atomic(root / "current-version.txt", (item.version + "\n").encode("ascii"))
-                except Exception:
+                    committed = True
+                except Exception as err:
                     if child and child.poll() is None:
-                        child.terminate()
-                        child.wait(timeout=5)
+                        try:
+                            child.terminate()
+                            child.wait(timeout=5)
+                        except (OSError, subprocess.SubprocessError) as stop_error:
+                            can_restart = False
+                            raise VPNError(f"{failure_detail(err)}；关闭新版进程失败：{failure_detail(stop_error)}") from err
                     raise
                 try:
                     sync_windows_app_version(root, item.version)
@@ -430,8 +532,17 @@ def apply_pending(root, parent):
                 except OSError:
                     pass
                 shutil.rmtree(staging, ignore_errors=True)
-    except Exception:
+    except Exception as err:
+        if committed:
+            return 0
         # The old runtime is retained and its data was never moved or overwritten.
-        subprocess.Popen([str(old), "--update-failed"], cwd=old.parent)
+        detail = f"{stage}失败：{failure_detail(err)}"
+        if can_restart:
+            try:
+                subprocess.Popen([str(old), "--update-failed", detail], cwd=old.parent)
+                return 1
+            except OSError as restart_error:
+                detail += f"\n重新启动原版本失败：{failure_detail(restart_error)}"
+        notify_failure(detail)
         return 1
     return 0

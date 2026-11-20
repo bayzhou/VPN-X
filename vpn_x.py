@@ -1415,9 +1415,11 @@ class Window(QMainWindow):
             try:
                 subprocess.Popen([sys.executable, "--apply-update", str(os.getpid())],
                                  cwd=Path(sys.executable).parent)
-            except OSError:
+            except OSError as err:
                 self.show_window()
-                QMessageBox.warning(self, "无法更新", "更新程序未能启动，可在设置里重试。")
+                detail = f"启动更新程序失败：{updates.failure_detail(err)}"
+                self.events.line(detail)
+                QMessageBox.warning(self, "无法更新", f"{detail}\n\n可在代理设置中重新检查更新。")
                 return
         if self.tray:
             self.tray.hide()
@@ -1500,7 +1502,7 @@ def migrate_data(data_dir):
                 old.unlink()
 
 
-def run_window(app, data_dir, *, check_startup=False, install_root=None, health=None, update_failed=False):
+def run_window(app, data_dir, *, check_startup=False, install_root=None, health=None, update_failure=None):
     lock_dir = data_dir if check_startup else LEGACY_DATA
     lock_dir.mkdir(parents=True, exist_ok=True)
     channel = "VPN-X-" + hashlib.sha256(str(lock_dir).lower().encode()).hexdigest()[:24]
@@ -1546,9 +1548,16 @@ def run_window(app, data_dir, *, check_startup=False, install_root=None, health=
             QTimer.singleShot(0, lambda: app.exit(0))
         elif health:
             QTimer.singleShot(0, lambda: atomic(health, b"ready"))
-        elif update_failed:
-            QTimer.singleShot(0, lambda: QMessageBox.warning(window, "软件更新失败",
-                              "已保留原版本。可在设置中重新检查更新。"))
+        elif update_failure:
+            window.events.line(f"软件更新失败 · {update_failure}")
+
+            def show_update_failure():
+                prompt = QMessageBox(QMessageBox.Icon.Warning, "软件更新失败", "", parent=window)
+                prompt.setTextFormat(Qt.TextFormat.PlainText)
+                prompt.setText(f"{update_failure}\n\n已保留原版本。可在代理设置中重新检查更新。")
+                prompt.exec()
+
+            QTimer.singleShot(0, show_update_failure)
         window.show()
         if install_root and not check_startup:
             Thread(target=updates.maintain_installation, args=(install_root, APP_VERSION, window.events.line),
@@ -1562,7 +1571,11 @@ def main():
     root = updates.installed_root()
     args = sys.argv[1:]
     if len(args) == 2 and args[0] == "--apply-update" and root and args[1].isdigit():
-        return updates.apply_pending(root, int(args[1]))
+        def notify_failure(detail):
+            ctypes.windll.user32.MessageBoxW(None, f"{detail}\n\n请关闭 VPN-X 后从开始菜单重新打开。",
+                                              "软件更新失败", 0x10030)
+
+        return updates.apply_pending(root, int(args[1]), notify_failure)
     if sys.argv[1:] == ["--check-clash"]:
         with Bench(find_verge(), lambda *_: None) as runtime:
             return 0 if runtime.core.call("GET", "/version").get("meta") else 1
@@ -1593,10 +1606,13 @@ def main():
             return 1
         return 0
     health = None
+    update_failure = None
     if root and len(args) == 2 and args[0] == "--update-health" and re.fullmatch(r"[a-f0-9]{24}", args[1]):
         health = root / "updates" / ("health-" + args[1])
+    if root and args[:1] == ["--update-failed"]:
+        update_failure = args[1] if len(args) == 2 and args[1] else "旧版更新程序未记录失败原因。"
     return run_window(app, LEGACY_DATA if root else DATA, install_root=root, health=health,
-                      update_failed=args == ["--update-failed"])
+                      update_failure=update_failure)
 
 
 if __name__ == "__main__":
