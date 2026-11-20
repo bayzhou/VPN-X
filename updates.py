@@ -29,6 +29,9 @@ from catalog import VPNError, atomic, url
 
 NO_WINDOW = 0x08000000
 MAX_PACKAGE = 768 * 1024**2
+# The 64-bit Inno Setup uninstall entry for the AppId in installer.iss.
+UNINSTALL_KEY = (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+                 r"\{FA63F85D-822B-4A4F-B2D1-5817445DFC1C}_is1")
 
 
 def version(text):
@@ -64,6 +67,24 @@ def current_version(root):
 def version_exe(root, value):
     version(value)
     return root / "versions" / value / EXE_NAME
+
+
+def sync_windows_app_version(root, release):
+    if current_version(root) != release:
+        return
+    access = winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0, access) as key:
+        location, _ = winreg.QueryValueEx(key, "InstallLocation")
+        if not isinstance(location, str) or Path(location) != root:
+            raise VPNError("Windows 已安装的应用记录与当前安装目录不一致")
+        name, _ = winreg.QueryValueEx(key, "DisplayName")
+        registered_version, _ = winreg.QueryValueEx(key, "DisplayVersion")
+        if isinstance(name, str):
+            updated_name = re.sub(r"(?<=\s)([vV]?)[0-9]{1,4}\.[0-9]{1,4}(?=\s*\Z)", r"\g<1>" + release, name)
+            if updated_name != name:
+                winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, updated_name)
+        if registered_version != release:
+            winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ, release)
 
 
 def signing_bytes(data):
@@ -301,6 +322,11 @@ def apply_pending(root, parent):
                         child.terminate()
                         child.wait(timeout=5)
                     raise
+                try:
+                    sync_windows_app_version(root, item.version)
+                except (OSError, VPNError):
+                    # The runtime is committed. The new process can retry the display metadata.
+                    pass
             finally:
                 try:
                     health.unlink(missing_ok=True)

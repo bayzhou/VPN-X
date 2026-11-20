@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import winreg
 from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
@@ -98,9 +99,39 @@ class Updates(unittest.TestCase):
                 self.assertEqual(updates.check(self.root, manifest_url, lambda *_: None).version, "99.1")
         self.assertEqual(requested, [manifest_url, manifest["url"], manifest_url])
 
+    def test_windows_app_version_preserves_the_localized_name(self):
+        (self.root / "current-version.txt").write_text("99.1\n", encoding="ascii")
+        for before, after in (("VPN-X 版本 1.4", "VPN-X 版本 99.1"),
+                              ("VPN-X version 1.4", "VPN-X version 99.1"),
+                              ("VPN-X V1.4", "VPN-X V99.1"),
+                              ("VPN-X", "VPN-X")):
+            with self.subTest(before=before):
+                values = {"InstallLocation": str(self.root) + "\\",
+                          "DisplayName": before, "DisplayVersion": "1.4"}
+
+                def set_value(key, name, reserved, value_type, value):
+                    values[name] = value
+
+                with (patch.object(winreg, "OpenKey") as open_key,
+                      patch.object(winreg, "QueryValueEx", side_effect=lambda _, name: (values[name], winreg.REG_SZ)),
+                      patch.object(winreg, "SetValueEx", side_effect=set_value) as write):
+                    updates.sync_windows_app_version(self.root, "1.4")
+                    open_key.assert_not_called()
+                    updates.sync_windows_app_version(self.root, "99.1")
+                    open_key.assert_called_once_with(winreg.HKEY_LOCAL_MACHINE, updates.UNINSTALL_KEY, 0,
+                                                     winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY)
+                    self.assertEqual((values["DisplayName"], values["DisplayVersion"]), (after, "99.1"))
+                    write.reset_mock()
+                    updates.sync_windows_app_version(self.root, "99.1")
+                    write.assert_not_called()
+                    values["InstallLocation"] = str(self.root / "another installation")
+                    with self.assertRaises(VPNError):
+                        updates.sync_windows_app_version(self.root, "99.1")
+                    write.assert_not_called()
+
     def test_switch_commits_on_healthy_start_and_keeps_old_on_failure(self):
-        for healthy in (False, True):
-            with self.subTest(healthy=healthy), TemporaryDirectory() as tmp:
+        for healthy, registry_error in ((False, False), (True, False), (True, True)):
+            with self.subTest(healthy=healthy, registry_error=registry_error), TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 cache = root / "updates"
                 cache.mkdir()
@@ -124,12 +155,23 @@ class Updates(unittest.TestCase):
                     if healthy and args[1] == "--update-health":
                         (cache / f"health-{args[2]}").write_bytes(b"ready")
                     return child
+
+                def sync_version(install_root, release):
+                    self.assertEqual(updates.current_version(install_root), release)
+                    if registry_error:
+                        raise PermissionError("Registry is read-only")
+
                 with (patch.object(updates, "trust_key", self.key.public_key().public_bytes_raw),
                       patch.object(updates, "extract_package", extract),
                       patch.object(updates.win32api, "OpenProcess", side_effect=pywintypes.error(87, "OpenProcess", "exited")),
-                      patch.object(updates, "check_runtime"), patch.object(subprocess, "Popen", launch)):
+                      patch.object(updates, "check_runtime"), patch.object(subprocess, "Popen", launch),
+                      patch.object(updates, "sync_windows_app_version", side_effect=sync_version) as sync):
                     self.assertEqual(updates.apply_pending(root, 98765), 0 if healthy else 1)
                 self.assertEqual(updates.current_version(root), "99.1" if healthy else APP_VERSION)
                 self.assertEqual(old.read_bytes(), b"old runtime")
-                if not healthy:
+                if healthy:
+                    sync.assert_called_once_with(root, "99.1")
+                    self.assertEqual(len(starts), 1)
+                else:
+                    sync.assert_not_called()
                     self.assertEqual(starts[-1], [str(old), "--update-failed"])

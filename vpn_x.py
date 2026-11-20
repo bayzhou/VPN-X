@@ -1448,6 +1448,21 @@ def run_window(app, data_dir, *, check_startup=False, install_root=None, health=
                     except Exception:
                         pass
             app.commitDataRequest.connect(session_end)
+            if install_root:
+                # Older updaters leave the Windows entry untouched. Wait for their commit lock.
+                sync_deadline = time.monotonic() + (30 if health else 0)
+
+                def sync_windows_version():
+                    try:
+                        with updates.install_lock(install_root):
+                            updates.sync_windows_app_version(install_root, APP_VERSION)
+                    except (OSError, VPNError):
+                        if time.monotonic() < sync_deadline:
+                            QTimer.singleShot(500, window, sync_windows_version)
+                        else:
+                            window.events.line("未能同步 Windows 已安装的应用版本信息")
+
+                QTimer.singleShot(0, window, sync_windows_version)
         if check_startup:
             window.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
             QTimer.singleShot(0, lambda: app.exit(0))
