@@ -68,6 +68,9 @@ PATHS = {
     "settings": '<path d="M4 6h3m4 0h9M4 12h9m4 0h3M4 18h5m4 0h7"/><circle cx="9" cy="6" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="11" cy="18" r="2"/>',
     "advanced": '<path d="M7.5 10V8a4.5 4.5 0 0 1 9 0v2m-4.5 4v2.5"/><rect x="5" y="10" width="14" height="10" rx="2.5"/>',
     "logs": '<rect x="5" y="3" width="14" height="18" rx="2.5"/><path d="M9 8h6m-6 4h6m-6 4h4"/>',
+    "minimize": '<path d="M6.5 12h11"/>',
+    "fullScreen": '<path d="M9 5.5H5.5V9m9-3.5H18V9M5.5 15v3.5H9m9-3.5v3.5h-3.5"/>',
+    "exitFullScreen": '<path d="M5.5 9H9V5.5m9 3.5h-3.5V5.5M9 18.5V15H5.5m9 3.5V15H18"/>',
     "close": '<path d="m7 7 10 10m0-10L7 17"/>',
 }
 

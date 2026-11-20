@@ -16,8 +16,8 @@ from threading import Lock
 import time
 import traceback
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QLockFile, QSize, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QFont, QIcon
+from PySide6.QtCore import QAbstractTableModel, QEvent, QModelIndex, QLockFile, QRectF, QSize, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtGui import QFont, QIcon, QPainterPath, QRegion
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
@@ -31,6 +31,7 @@ from ai_dialog import AIDialog
 from ai_support import GUIDE, load_ai_config, save_ai_config
 from ui_icons import application_icon, stroke_icon
 from ui_theme import light_palette
+from ui_titlebar import TitleBar, WindowDecoration, window_frame_result
 from ui_transitions import PageTurnStack
 from automation import BACKUP_INTERVAL, DEFAULTS, HEALTH_INTERVAL, Engine
 from catalog import (
@@ -87,8 +88,22 @@ QSpinBox::up-arrow { image:url(:/qt-project.org/styles/commonstyle/images/arrow-
     width:9px; height:9px; }
 QSpinBox::down-arrow { image:url(:/qt-project.org/styles/commonstyle/images/arrow-down-16.png);
     width:9px; height:9px; }
-QWidget#sidebar { background:#f7f7f7; border-right:1px solid #e5e5e5; }
-QLabel#sidebarBrand { font-size:17px; font-weight:700; }
+QWidget#sidebar, QWidget#titleBar { background:#f7f7f7; }
+QWidget#sidebar { border-right:1px solid #e5e5e5; }
+QWidget#titleBar { border-bottom:1px solid #e5e5e5; }
+QLabel#titleBarName { font-size:15px; font-weight:700; }
+QToolButton#minimizeWindow, QToolButton#fullScreenWindow, QToolButton#closeWindow {
+    background:transparent; border:1px solid transparent; border-radius:8px; padding:0;
+}
+QToolButton#minimizeWindow:hover, QToolButton#fullScreenWindow:hover, QToolButton#closeWindow:hover {
+    background:#efefef;
+}
+QToolButton#minimizeWindow:pressed, QToolButton#fullScreenWindow:pressed, QToolButton#closeWindow:pressed {
+    background:#e3e3e3;
+}
+QToolButton#minimizeWindow:focus, QToolButton#fullScreenWindow:focus, QToolButton#closeWindow:focus {
+    border-color:#767676;
+}
 QPushButton#askAI {
     text-align:left; background:transparent; border:1px solid #dedede; border-radius:11px;
     padding:7px 10px; color:#0d0d0d; font-weight:550;
@@ -117,6 +132,14 @@ QHeaderView::section {
 }
 QHeaderView::section:first { border-top-left-radius:12px; }
 QHeaderView::section:last { border-top-right-radius:12px; }
+QFrame#nodeListFrame {
+    background:qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #f5f5f5, stop:0.5 #f5f5f5, stop:0.501 #fff, stop:1 #fff);
+    border:1px solid #e5e5e5; border-radius:14px;
+}
+QTableView#nodeList { border:0; border-radius:0; }
+QTableView#nodeList QHeaderView { background:#f5f5f5; }
+QTableView#nodeList QHeaderView::section { border-radius:0; }
 QTableWidget::item, QTableView::item { border-bottom:1px solid #ededed; padding-left:9px; }
 QStatusBar { background:#fff; color:#5d5d5d; border-top:1px solid #ededed; }
 QStatusBar::item { border:0; }
@@ -347,6 +370,15 @@ class Events:
         return progress, lines
 
 
+class NodeListView(QTableView):
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Clip the header, viewport, and scrollbars to the same inner outline.
+        outline = QPainterPath()
+        outline.addRoundedRect(QRectF(self.rect()), 13, 13)
+        self.setMask(QRegion(outline.toFillPolygon().toPolygon()))
+
+
 class NodeTable(QAbstractTableModel):
     headers = ("节点", "厂商 / 代理组", "剩余流量", "连接延迟", "连接")
 
@@ -428,6 +460,7 @@ class Window(QMainWindow):
         self.setWindowTitle(f"{APP_NAME} V{APP_VERSION} · 自动代理")
         self.resize(1040, 725)
         self.setMinimumSize(760, 590)
+        self.restore_maximized = False
         self.config_file = data_dir / "settings.json"
         self.source_file = data_dir / SOURCE_FILENAME
         self.catalog_source = CatalogSource()
@@ -460,6 +493,7 @@ class Window(QMainWindow):
         self.save_timer.setInterval(450)
         self.save_timer.timeout.connect(self.persist_edits)
         self.build()
+        self.decoration = WindowDecoration(self)
         self.events_timer = QTimer(self)
         self.events_timer.setInterval(200)
         self.events_timer.timeout.connect(self.flush_events)
@@ -478,7 +512,15 @@ class Window(QMainWindow):
         panel = QWidget()
         panel.setObjectName("mainSurface")
         self.setCentralWidget(panel)
-        split = QHBoxLayout(panel)
+        frame = QVBoxLayout(panel)
+        frame.setContentsMargins(0, 0, 0, 0)
+        frame.setSpacing(0)
+        self.title_bar = TitleBar(self)
+        frame.addWidget(self.title_bar)
+
+        body = QWidget()
+        frame.addWidget(body, 1)
+        split = QHBoxLayout(body)
         split.setContentsMargins(0, 0, 0, 0)
         split.setSpacing(0)
         split.addWidget(self.sidebar())
@@ -497,6 +539,7 @@ class Window(QMainWindow):
             self.navigation.addItem(QListWidgetItem(stroke_icon(icon), title))
         self.navigation.currentRowChanged.connect(self.turn_page)
         self.navigation.setCurrentRow(0)
+        self.navigation.setFocus()
         layout.addWidget(self.pages, 1)
         self.progress_panel = QWidget()
         progress_layout = QVBoxLayout(self.progress_panel)
@@ -513,6 +556,26 @@ class Window(QMainWindow):
         self.progress_timer = QTimer(self)
         self.progress_timer.setSingleShot(True)
         self.progress_timer.timeout.connect(self.progress_panel.hide)
+
+    def nativeEvent(self, event_type, message):
+        result = window_frame_result(self, getattr(self, "title_bar", None), event_type, message)
+        return super().nativeEvent(event_type, message) if result is None else (True, result)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "title_bar"):
+            self.title_bar.show_full_screen_state(self.isFullScreen())
+
+    def toggle_full_screen(self):
+        if self.isFullScreen():
+            if self.restore_maximized:
+                self.showMaximized()
+            else:
+                self.showNormal()
+        else:
+            self.restore_maximized = self.isMaximized()
+            self.showFullScreen()
+
     def log_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -532,12 +595,8 @@ class Window(QMainWindow):
         panel.setObjectName("sidebar")
         panel.setFixedWidth(196)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(12, 19, 12, 15)
+        layout.setContentsMargins(12, 13, 12, 15)
         layout.setSpacing(12)
-        name = banner(APP_NAME, "brand")
-        name.setObjectName("sidebarBrand")
-        name.setContentsMargins(9, 0, 0, 0)
-        layout.addWidget(name)
         ask = button("Ask AI", self.open_ai)
         ask.setObjectName("askAI")
         ask.setIcon(stroke_icon("search"))
@@ -636,7 +695,13 @@ class Window(QMainWindow):
         switch.addWidget(banner("代理组", "muted"))
         switch.addWidget(self.group, 1)
         layout.addLayout(switch)
-        self.table = QTableView()
+        node_list_frame = QFrame()
+        node_list_frame.setObjectName("nodeListFrame")
+        node_list_layout = QVBoxLayout(node_list_frame)
+        node_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.table = NodeListView()
+        self.table.setObjectName("nodeList")
+        node_list_layout.addWidget(self.table)
         self.node_table = NodeTable(self.table)
         self.table.setModel(self.node_table)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -660,7 +725,7 @@ class Window(QMainWindow):
         header.setResizeContentsPrecision(0)
         for i in range(2, self.node_table.columnCount()):
             header.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
-        layout.addWidget(self.table, 1)
+        layout.addWidget(node_list_frame, 1)
         self.set_controls(False)
         return page
 
@@ -1285,7 +1350,8 @@ class Window(QMainWindow):
         self.tray.show()
 
     def show_window(self):
-        self.showNormal()
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        self.show()
         self.raise_()
         self.activateWindow()
 
