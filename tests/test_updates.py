@@ -129,6 +129,52 @@ class Updates(unittest.TestCase):
                         updates.sync_windows_app_version(self.root, "99.1")
                     write.assert_not_called()
 
+    def test_startup_cleans_only_older_versions_after_commit_and_retries_busy_files(self):
+        releases = ("1.3", "1.4", "1.5", "1.6")
+        paths = {release: updates.version_exe(self.root, release) for release in releases}
+        for exe in paths.values():
+            exe.parent.mkdir(parents=True)
+            exe.write_bytes(b"runtime")
+        keep = self.root / "versions" / "notes.txt"
+        keep.write_text("notes")
+        config = self.root / "catalog-source.json"
+        config.write_text("{}")
+        marker = self.root / "current-version.txt"
+        marker.write_text("1.4\n", encoding="ascii")
+        logs = []
+        real_remove = updates.shutil.rmtree
+        failed_once = False
+
+        def remove(folder):
+            nonlocal failed_once
+            self.assertEqual(updates.current_version(self.root), "1.5")
+            self.assertIn(folder, (paths["1.3"].parent, paths["1.4"].parent))
+            if not failed_once:
+                failed_once = True
+                raise PermissionError("Previous updater is still running")
+            real_remove(folder)
+
+        with (patch.object(updates, "sync_windows_app_version") as sync,
+              patch.object(updates.shutil, "rmtree", side_effect=remove) as cleanup,
+              patch.object(updates.time, "sleep") as retry):
+            updates.maintain_installation(self.root, "1.5", logs.append)
+            cleanup.assert_not_called()
+            sync.assert_not_called()
+            self.assertTrue(all(exe.is_file() for exe in paths.values()))
+
+            marker.write_text("1.5\n", encoding="ascii")
+            updates.maintain_installation(self.root, "1.5", logs.append)
+            sync.assert_called_once_with(self.root, "1.5")
+            retry.assert_called_once()
+
+        self.assertFalse(paths["1.3"].parent.exists())
+        self.assertFalse(paths["1.4"].parent.exists())
+        self.assertTrue(paths["1.5"].is_file())
+        self.assertTrue(paths["1.6"].is_file())
+        self.assertEqual(keep.read_text(), "notes")
+        self.assertEqual(config.read_text(), "{}")
+        self.assertCountEqual(logs, ["已清理旧版本 V1.3", "已清理旧版本 V1.4"])
+
     def test_switch_commits_on_healthy_start_and_keeps_old_on_failure(self):
         for healthy, registry_error in ((False, False), (True, False), (True, True)):
             with self.subTest(healthy=healthy, registry_error=registry_error), TemporaryDirectory() as tmp:
@@ -175,3 +221,9 @@ class Updates(unittest.TestCase):
                 else:
                     sync.assert_not_called()
                     self.assertEqual(starts[-1], [str(old), "--update-failed"])
+                with (patch.object(updates, "trust_key", self.key.public_key().public_bytes_raw),
+                      patch.object(updates, "sync_windows_app_version")):
+                    updates.maintain_installation(root, updates.current_version(root), lambda _: None)
+                self.assertEqual(old.parent.exists(), not healthy)
+                self.assertEqual(archive.exists(), not healthy)
+                self.assertEqual((cache / "manifest.json").exists(), not healthy)

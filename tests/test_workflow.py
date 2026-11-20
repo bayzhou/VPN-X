@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 
 import automation
 from catalog import (CatalogDownloadError, CatalogSource, Node, Profile, Vendor, decode_catalog, decrypt,
-                     direct_hosts, encrypt, VPNError, vendors)
+                     direct_hosts, encrypt, parse_yaml, VPNError, vendors)
 import verge
 
 
@@ -71,7 +71,7 @@ class Workflow(unittest.TestCase):
         engine.profile_catalog = {a.id, b.id}
         engine.complete_profiles = {a.id}
 
-        def download(vendor, report, fetch):
+        def download(vendor, report, fetch, *, download):
             result = responses[vendor.id]
             if result is None:
                 raise VPNError("network failure")
@@ -399,11 +399,14 @@ proxy-groups:
                 if url == address:
                     download_states.append((windows[0], engine.current))
                     return package, {}, 0
-                if url == provider:
-                    return subscription, {"subscription-userinfo": "upload=1; download=2; total=10"}, 0
                 return real_request(url, **kwargs)
 
+            def download(url, **kwargs):
+                self.assertEqual(url, provider)
+                return parse_yaml(subscription), {"subscription-userinfo": "upload=1; download=2; total=10"}
+
             stack.enter_context(patch.object(automation, "request_data", fetch))
+            stack.enter_context(patch.object(automation, "download_subscription", download))
             source_file = tmp / "catalog-source.json"
             source.save(source_file)
             settings = dict(automation.DEFAULTS, **CatalogSource.load(source_file).settings())
@@ -414,6 +417,9 @@ proxy-groups:
                     engine.refresh(settings)
             local = tmp / "local.vxp"
             local.write_bytes(package)
+            engine.refresh(dict(settings, proxy_settings_locked=True), local)
+            self.assertEqual(engine.imported_settings, {})
+            self.assertEqual(len(engine.profiles), 1)
             engine.refresh(settings, local)
             self.assertEqual(engine.imported_settings, exported_settings)
             engine.auto(settings)

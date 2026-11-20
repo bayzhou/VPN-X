@@ -22,6 +22,7 @@ from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 MAGIC = b"VPN-X\x00\x01"
 MAX_DOWNLOAD = 8 * 1024 * 1024
+DOWNLOAD_HEADERS = {"User-Agent": "clash-verge/v2.5 VPN-X/1", "Accept-Encoding": "identity"}
 DEFAULT_CHECK = "https://chatgpt.com/robots.txt"
 CLOUDFLARE_CHECK = "https://cp.cloudflare.com/generate_204"
 SOURCE_FILENAME = "catalog-source.json"
@@ -182,7 +183,7 @@ def request_data(address, *, limit=MAX_DOWNLOAD, seconds=18, proxy=None, revalid
             session.trust_env = False
             if proxy:
                 session.proxies.update(http=proxy, https=proxy)
-            headers = {"User-Agent": "clash-verge/v2.5 VPN-X/1", "Accept-Encoding": "identity"}
+            headers = DOWNLOAD_HEADERS.copy()
             if revalidate:
                 headers["Cache-Control"] = "no-cache"
             # Enforce HTTPS on every redirect when the original URL uses TLS.
@@ -418,8 +419,22 @@ class Profile:
     quota: int | None
 
 
+def profile_sections(doc):
+    nodes = doc.get("proxies") or []
+    if not isinstance(nodes, list):
+        raise VPNError("订阅的 proxies 字段无效")
+    providers = doc.get("proxy-providers") or {}
+    if not isinstance(providers, dict) or len(providers) > 32:
+        raise VPNError("节点提供者格式无效或数量过多")
+    groups = doc.get("proxy-groups") or []
+    if not isinstance(groups, list) or len(groups) > 256:
+        raise VPNError("代理组格式无效或数量过多")
+    return nodes, providers, groups
+
+
 def parse_profile(vendor, doc, quota, log, fetch):
     nodes, providers, groups = {}, {}, {}
+    raw_nodes, raw_providers, raw_groups = profile_sections(doc)
 
     def add(raw):
         if not isinstance(raw, dict) or raw.get("type") not in TYPES:
@@ -437,13 +452,7 @@ def parse_profile(vendor, doc, quota, log, fetch):
         nodes.setdefault(name, Node(key, label(name), dict(config, name=key)))
         return name
 
-    raw_nodes = doc.get("proxies") or []
-    if not isinstance(raw_nodes, list):
-        raise VPNError("订阅的 proxies 字段无效")
     inline = [n for raw in raw_nodes if (n := add(raw))]
-    raw_providers = doc.get("proxy-providers") or {}
-    if not isinstance(raw_providers, dict) or len(raw_providers) > 32:
-        raise VPNError("节点提供者格式无效或数量过多")
     for k, spec in raw_providers.items():
         try:
             if not isinstance(spec, dict):
@@ -460,9 +469,6 @@ def parse_profile(vendor, doc, quota, log, fetch):
         except VPNError as e:
             log(f"{vendor.name} / {label(k)}：节点提供者更新失败：{e}")
 
-    raw_groups = doc.get("proxy-groups") or []
-    if not isinstance(raw_groups, list) or len(raw_groups) > 256:
-        raise VPNError("代理组格式无效或数量过多")
     specs = {g["name"]: g for g in raw_groups if isinstance(g, dict)
              and isinstance(g.get("name"), str) and g["name"] not in nodes}
 
@@ -533,10 +539,13 @@ def parse_profile(vendor, doc, quota, log, fetch):
     return Profile(vendor, nodes, groups, quota)
 
 
-def fetch_profile(vendor, log, fetch=request_data):
-    data, headers, _ = fetch(vendor.url)
-    return parse_profile(vendor, parse_yaml(data), remaining(headers.get("subscription-userinfo", "")),
-                         log, fetch)
+def fetch_profile(vendor, log, fetch=request_data, *, download=None):
+    if download is None:
+        data, headers, _ = fetch(vendor.url)
+        document = parse_yaml(data)
+    else:
+        document, headers = download(vendor.url)
+    return parse_profile(vendor, document, remaining(headers.get("subscription-userinfo", "")), log, fetch)
 
 
 REGIONS = {

@@ -1,6 +1,7 @@
 PySide6>=6.8,<7
 cryptography>=44,<49
 requests>=2.32.4,<3
+httpx>=0.28,<1
 PyYAML>=6.0.2,<7
 pywin32>=308
 regex>=2025.7

@@ -12,7 +12,7 @@ import re
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
-from threading import Lock
+from threading import Lock, Thread
 import time
 import traceback
 
@@ -59,6 +59,7 @@ QPushButton {
 QPushButton:hover { background:#f4f4f4; border-color:#c8c8c8; }
 QPushButton:pressed { background:#e8e8e8; }
 QPushButton:focus { border-color:#767676; }
+QPushButton#proxyConfigLock:checked { background:#e5e5e5; }
 QPushButton[primary="true"] { background:#0d0d0d; color:#fff; border-color:#0d0d0d; min-width:74px; }
 QPushButton[primary="true"]:hover { background:#2f2f2f; }
 QPushButton[primary="true"]:pressed { background:#000000; }
@@ -739,7 +740,15 @@ class Window(QMainWindow):
         card_layout = QVBoxLayout(self.settings_form)
         card_layout.setContentsMargins(20, 16, 20, 18)
         card_layout.setSpacing(12)
-        card_layout.addWidget(banner("代理配置", "section"))
+        config_heading = QHBoxLayout()
+        config_heading.addWidget(banner("代理配置", "section"), 1)
+        self.proxy_lock_button = QPushButton("锁定")
+        self.proxy_lock_button.setObjectName("proxyConfigLock")
+        self.proxy_lock_button.setCheckable(True)
+        self.proxy_lock_button.setToolTip("锁定后使用本机代理配置，订阅仍会更新")
+        self.proxy_lock_button.toggled.connect(self.change_proxy_lock)
+        config_heading.addWidget(self.proxy_lock_button)
+        card_layout.addLayout(config_heading)
         form = QFormLayout()
         card_layout.addLayout(form)
         form.setHorizontalSpacing(14)
@@ -943,6 +952,7 @@ class Window(QMainWindow):
                 if not saved.get("endpoint_presets") and saved.get("check") == CLOUDFLARE_CHECK:
                     saved["check"] = DEFAULT_CHECK
                 data.update(catalog_settings({k: saved[k] for k in PUBLIC_SETTINGS if k in saved}))
+                data["proxy_settings_locked"] = saved.get("proxy_settings_locked") is True
                 exceptions = saved.get("direct_hosts", "")
                 direct_hosts(exceptions)
                 data["direct_hosts"] = exceptions
@@ -958,6 +968,7 @@ class Window(QMainWindow):
 
     def apply_fields(self, data):
         self.settings_loading = True
+        self.proxy_lock_button.setChecked(data.get("proxy_settings_locked", False))
         for key, field in self.fields.items():
             value = data[key]
             if isinstance(field, EndpointChoice):
@@ -983,7 +994,8 @@ class Window(QMainWindow):
                 result[key] = field.text().strip()
         exceptions = result.pop("direct_hosts")
         direct_hosts(exceptions)
-        return dict(catalog_settings(result), direct_hosts=exceptions, **self.catalog_source.settings())
+        return dict(catalog_settings(result), direct_hosts=exceptions,
+                    proxy_settings_locked=self.proxy_lock_button.isChecked(), **self.catalog_source.settings())
 
     def save_settings(self, data):
         if hasattr(self, "saved") and any(data[k] != self.saved[k] for k in ("catalog", "password", "hours")):
@@ -1004,6 +1016,21 @@ class Window(QMainWindow):
     def schedule_save(self, *_):
         if not self.settings_loading:
             self.save_timer.start()
+
+    def change_proxy_lock(self, locked):
+        self.proxy_lock_button.setText("解除锁定" if locked else "锁定")
+        if self.settings_loading:
+            return
+        self.save_timer.stop()
+        try:
+            self.save_settings(self.settings())
+        except (VPNError, OSError) as error:
+            self.settings_loading = True
+            self.proxy_lock_button.setChecked(self.saved.get("proxy_settings_locked", False))
+            self.settings_loading = False
+            self.statusBar().showMessage(f"未能保存锁定设置：{error}", 5000)
+        else:
+            self.statusBar().showMessage("代理配置已锁定" if locked else "代理配置已解除锁定", 3500)
 
     def persist_edits(self):
         try:
@@ -1160,7 +1187,7 @@ class Window(QMainWindow):
                     self.catalog_editor.ai_model.set_address(self.ai_model)
             except Exception:
                 self.events.line("无法安全保存 VXP 中的 AI 凭据")
-        if imported:
+        if imported and not self.saved.get("proxy_settings_locked"):
             self.saved = dict(self.saved, **imported)
             self.apply_fields(self.saved)
             self.events.line("已应用加密目录中的软件配置")
@@ -1514,21 +1541,6 @@ def run_window(app, data_dir, *, check_startup=False, install_root=None, health=
                     except Exception:
                         pass
             app.commitDataRequest.connect(session_end)
-            if install_root:
-                # Older updaters leave the Windows entry untouched. Wait for their commit lock.
-                sync_deadline = time.monotonic() + (30 if health else 0)
-
-                def sync_windows_version():
-                    try:
-                        with updates.install_lock(install_root):
-                            updates.sync_windows_app_version(install_root, APP_VERSION)
-                    except (OSError, VPNError):
-                        if time.monotonic() < sync_deadline:
-                            QTimer.singleShot(500, window, sync_windows_version)
-                        else:
-                            window.events.line("未能同步 Windows 已安装的应用版本信息")
-
-                QTimer.singleShot(0, window, sync_windows_version)
         if check_startup:
             window.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
             QTimer.singleShot(0, lambda: app.exit(0))
@@ -1538,6 +1550,9 @@ def run_window(app, data_dir, *, check_startup=False, install_root=None, health=
             QTimer.singleShot(0, lambda: QMessageBox.warning(window, "软件更新失败",
                               "已保留原版本。可在设置中重新检查更新。"))
         window.show()
+        if install_root and not check_startup:
+            Thread(target=updates.maintain_installation, args=(install_root, APP_VERSION, window.events.line),
+                   daemon=True).start()
         return app.exec()
     finally:
         lock.unlock()

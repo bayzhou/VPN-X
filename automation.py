@@ -10,9 +10,10 @@ from catalog import (
     decode_catalog_details, fetch_profile,
     region_rank, request_data, url,
 )
+from subscription_refresh import download_subscription
 from verge import Bench, DATA, Ownership, ensure_verge, find_verge
 
-DEFAULTS = dict(PUBLIC_SETTINGS, direct_hosts="", **CatalogSource().settings())
+DEFAULTS = dict(PUBLIC_SETTINGS, direct_hosts="", proxy_settings_locked=False, **CatalogSource().settings())
 HEALTH_INTERVAL = 5 * 60
 BACKUP_INTERVAL = 10 * 60
 BACKUP_LIFETIME = 2 * BACKUP_INTERVAL + HEALTH_INTERVAL
@@ -136,7 +137,11 @@ class Engine:
             result, _, ai_key, ai_model = decode_catalog_details(cache.read_bytes(), source.key)
         else:
             atomic(cache, payload)
-            self.imported_settings = imported
+            if settings.get("proxy_settings_locked"):
+                if imported:
+                    self.log("代理配置已锁定，继续使用本机配置")
+            else:
+                self.imported_settings = imported
             self.last_sync = time.time()
         self.catalog = result
         self.imported_ai = ai_key, ai_model
@@ -152,22 +157,20 @@ class Engine:
         def update(vendor):
             self.cancelled()
             self.log(f"{vendor.name}：更新订阅")
-            def attempt_profile(attempt):
-                issues = []
-                first = True
-                def report(message):
-                    issues.append(vendor.name)
-                    self.log(message)
-                def fetch(address, **kwargs):
-                    nonlocal first
-                    def request(index):
-                        return request_data(address, **kwargs, **({"proxy": proxy} if index and proxy else {}))
-                    if first:
-                        first = False
-                        return request(attempt)
-                    return self.retry(request, f"{vendor.name}节点源请求")
-                return fetch_profile(vendor, report, fetch), issues
-            return self.retry(attempt_profile, f"{vendor.name}订阅更新")
+            issues = []
+
+            def report(message):
+                issues.append(vendor.name)
+                self.log(message)
+
+            def fetch(address):
+                return self.retry(lambda attempt: request_data(address, proxy=proxy if attempt else None),
+                                  f"{vendor.name}节点源请求")
+
+            def download(address):
+                return download_subscription(address, proxy=proxy, cancelled=self.cancelled)
+
+            return fetch_profile(vendor, report, fetch, download=download), issues
 
         with ThreadPoolExecutor(max_workers=6) as pool:
             jobs = {pool.submit(update, v): v for v in self.catalog}

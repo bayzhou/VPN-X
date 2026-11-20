@@ -171,27 +171,31 @@ def check(root, address, progress, cancelled=lambda: None):
     # Protected by Program Files permissions on a normal installation. Never execute from a user temp folder.
     cache = root / "updates"
     try:
-        cache.mkdir(exist_ok=True)
         contents = io.BytesIO()
         _download(address, contents, 16384, lambda _: None, cancelled)
         raw = contents.getvalue()
         item = verify_manifest(raw, key)
         if version(item.version) <= version(APP_VERSION):
             return None
-        archive = cache / "update.zip"
-        if not package_matches(archive, item):
-            part = cache / f"{secrets.token_hex(12)}.part"
-            try:
-                with part.open("xb") as stream:
-                    _download(item.url, stream, item.size, lambda done: progress("下载更新包", done, item.size),
-                              cancelled)
-                if not package_matches(part, item):
-                    raise VPNError("更新包 SHA-256 校验失败")
-                os.replace(part, archive)
-            finally:
-                part.unlink(missing_ok=True)
-        archive_files(archive)
-        atomic(cache / "manifest.json", raw)
+        with install_lock(root):
+            cache.mkdir(exist_ok=True)
+            archive = cache / "update.zip"
+            if not package_matches(archive, item):
+                part = cache / f"{secrets.token_hex(12)}.part"
+                try:
+                    with part.open("xb") as stream:
+                        _download(item.url, stream, item.size, lambda done: progress("下载更新包", done, item.size),
+                                  cancelled)
+                    if not package_matches(part, item):
+                        raise VPNError("更新包 SHA-256 校验失败")
+                    archive_files(part)
+                    (cache / "manifest.json").unlink(missing_ok=True)
+                    os.replace(part, archive)
+                finally:
+                    part.unlink(missing_ok=True)
+            else:
+                archive_files(archive)
+            atomic(cache / "manifest.json", raw)
         return item
     except (OSError, requests.RequestException, BadZipFile) as err:
         raise VPNError("更新下载失败，请检查网络或安装目录权限") from err
@@ -271,6 +275,99 @@ def install_lock(root):
         finally:
             stream.seek(0)
             msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def remove_old_versions(root, release, log):
+    """Remove older runtime slots while the installed startup holds the update lock."""
+    active = version(release)
+    versions = root / "versions"
+    if (versions.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            or versions.resolve(strict=True) != versions or not version_exe(root, release).is_file()):
+        raise VPNError("无法确认安装版本目录")
+    complete = True
+    for folder in versions.iterdir():
+        try:
+            if version(folder.name) >= active:
+                continue
+        except VPNError:
+            continue
+        try:
+            info = folder.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                    or folder.resolve(strict=True) != folder):
+                continue
+            shutil.rmtree(folder)
+        except FileNotFoundError:
+            complete = complete and not folder.exists()
+        except OSError:
+            complete = False
+        else:
+            log(f"已清理旧版本 V{folder.name}")
+    return complete
+
+
+def remove_installed_package(root, release, log):
+    cache = root / "updates"
+    manifest = cache / "manifest.json"
+    archive = cache / "update.zip"
+    try:
+        if cache.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            return
+    except FileNotFoundError:
+        return
+    try:
+        raw = manifest.read_bytes()
+    except FileNotFoundError:
+        try:
+            archive.unlink()
+        except FileNotFoundError:
+            pass
+        else:
+            log("已清理未完成的更新包")
+        return
+    try:
+        item = verify_manifest(raw, trust_key())
+    except VPNError:
+        return
+    if version(item.version) > version(release):
+        return
+    archive.unlink(missing_ok=True)
+    manifest.unlink(missing_ok=True)
+    log(f"已清理 V{item.version} 更新包")
+
+
+def maintain_installation(root, release, log):
+    """Wait for the update commit, then maintain the installed version in the background."""
+    deadline = time.monotonic() + 30
+    synced = versions_cleaned = package_cleaned = False
+    while True:
+        try:
+            with install_lock(root):
+                if current_version(root) != release:
+                    return
+                if not synced:
+                    try:
+                        sync_windows_app_version(root, release)
+                    except (OSError, VPNError):
+                        pass
+                    else:
+                        synced = True
+                if not versions_cleaned:
+                    versions_cleaned = remove_old_versions(root, release, log)
+                if not package_cleaned:
+                    remove_installed_package(root, release, log)
+                    package_cleaned = True
+        except (OSError, VPNError):
+            pass
+        if synced and versions_cleaned and package_cleaned:
+            return
+        if time.monotonic() >= deadline:
+            if not synced:
+                log("未能同步 Windows 已安装的应用版本信息")
+            if not versions_cleaned or not package_cleaned:
+                log("旧版本或更新包清理未完成，下次启动时重试")
+            return
+        time.sleep(0.5)
 
 
 def apply_pending(root, parent):
